@@ -48,7 +48,6 @@ def _gather_sources(entry: Path) -> str:
     files.sort(key=lambda p: str(p.relative_to(base_dir)))
 
     parts = []
-    # Project files only (stdlib stubs are for IDEs; not injected into transpilation)
     for p in files:
         rel = str(p.relative_to(base_dir))
         parts.append(f"/* NEOAK_FILE: {rel} */\n" + p.read_text(encoding="utf-8"))

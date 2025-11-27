@@ -1,3 +1,15 @@
+Metadata-Version: 2.4
+Name: neoak
+Version: 0.1.0
+Summary: NeOak: Java-like transpiler runner without the JVM
+Author: NeOak Contributors
+Keywords: java,transpiler,language,cli
+Classifier: Programming Language :: Python :: 3
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Operating System :: OS Independent
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+
 # NeOak
 The Oak Project Reborn
 
@@ -221,18 +233,7 @@ NeOak behaves like “Java without the JVM”. You write Java‑like sources; th
 
 **Stdlib Stubs (for IDEs):**
 - Under `neoak/stdlib/java/...` you’ll find `java/lang/Object.java`, `java/lang/System.java`, `java/io/File.java`, `java/util/Scanner.java`.
-- These are editor‑facing stubs only. They are NOT compiled or injected into transpilation; the runner transpiles just your project files. At runtime the transpiler lowers usage to the Python shim (`neoak.rt`).
+- These are editor‑facing stubs; the transpiler lowers usage to the runtime shim at execution.
 
 **Design Choices:**
 - A minimal shim + Java‑facing stubs maximize familiarity while keeping behavior robust. Enforcement is Java‑style (semicolons, abstract/interface rules) with clear `file:line` diagnostics and Java‑like stack traces.
-
-## Experiment Notes
-
-NeOak is intentionally an experiment in “Java without the JVM”. Key guiding ideas:
-
-- Keep the surface area Java‑like: classes, interfaces/abstracts, `System.*`, familiar project layout, and IDE stubs.
-- Map semantics predictably to Python: `_neoak_plus` for `+`, field auto‑qualification, ABC for abstract/interface contracts, and practical `Scanner`/`File`.
-- Be strict where it helps: require semicolons, validate abstract/interface rules, and print Java‑style errors/tracebacks with original file:line.
-- Stay small and hackable: a thin shim and straightforward rewrites mean you can read the generated Python and understand what happened.
-
-This is not a JVM replacement. It won’t run `.class`/`.jar` artifacts, and some features are best‑effort approximations. But it’s a fun, pragmatic way to write Java‑ish code and run it instantly with Python.

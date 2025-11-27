@@ -71,11 +71,6 @@ def _replace_literals_and_ops(expr: str) -> str:
             out.append('min')
             i += len('Math.min')
             continue
-        # System.in -> __neoak_stdin
-        if expr.startswith('System.in', i):
-            out.append('__neoak_stdin')
-            i += len('System.in')
-            continue
         # obj.toString() -> str(obj) for simple dotted/identifier
         m = re.match(r"([A-Za-z_][A-Za-z0-9_\.]*)\.toString\(\)", expr[i:])
         if m:
@@ -108,14 +103,6 @@ def _replace_literals_and_ops(expr: str) -> str:
                 _replace_literals_and_ops(p.strip()) for p in parts if p.strip() != ''
             ]
             out.append("[" + ", ".join(parts) + "]")
-            i += m.end()
-            continue
-        # new java.io.Foo(...) or any dotted type -> Foo(...)
-        m = re.match(r"new\s+([A-Za-z_][A-Za-z0-9_\.]*?)\s*\(", expr[i:])
-        if m:
-            qname = m.group(1)
-            short = qname.split('.')[-1]
-            out.append(short + '(')
             i += m.end()
             continue
         # new ClassName(args) -> ClassName(args)
@@ -260,20 +247,6 @@ def _translate_statement(line: str) -> str:
         expr = _maybe_rewrite_string_concat(inner)
         return f"print({expr})"
 
-    # System.err.println
-    m = re.match(r"System\.err\.println\((.*)\)$", l)
-    if m:
-        inner = m.group(1).strip()
-        expr = _maybe_rewrite_string_concat(inner)
-        return f"print({expr}, file=__neoak_stderr)"
-
-    # System.err.print (no newline)
-    m = re.match(r"System\.err\.print\((.*)\)$", l)
-    if m:
-        inner = m.group(1).strip()
-        expr = _maybe_rewrite_string_concat(inner)
-        return f"print({expr}, end='', file=__neoak_stderr)"
-
     # System.out.print (no newline)
     m = re.match(r"System\.out\.print\((.*)\)$", l)
     if m:
@@ -283,7 +256,7 @@ def _translate_statement(line: str) -> str:
 
     # Variable declarations with optional initializer
     m = re.match(
-        r"(?:final\s+)?(int|double|boolean|String|[A-Za-z_][A-Za-z0-9_<>]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)(\[\])?\s+(\w+)\s*(?:=\s*(.*))?$",
+        r"(?:final\s+)?(int|double|boolean|String|[A-Z][A-Za-z0-9_<>]*)(\[\])?\s+(\w+)\s*(?:=\s*(.*))?$",
         l,
     )
     if m:
@@ -513,7 +486,7 @@ def _qualify_static_calls(s: str, class_name: str, static_names: set[str]) -> st
     return ''.join(out)
 
 
-def _translate_block(body: str, instance: bool = False, field_names: set[str] | None = None, param_names: list[str] | None = None, class_name: str | None = None, static_names: set[str] | None = None, source_file: str | None = None, source_start_line: int | None = None, method_name: str | None = None) -> str:
+def _translate_block(body: str, instance: bool = False, field_names: set[str] | None = None, param_names: list[str] | None = None, class_name: str | None = None, static_names: set[str] | None = None, source_file: str | None = None, source_start_line: int | None = None) -> str:
     # Convert a Java-like block (no method/class signatures) into Python
     lines = [ln for ln in body.splitlines()]
     out: list[str] = []
@@ -528,7 +501,7 @@ def _translate_block(body: str, instance: bool = False, field_names: set[str] | 
             return
         # Add source mapping marker if available
         if source_file and source_start_line is not None and line.strip() != "":
-            out.append(("    " * indent) + f"# NEOAK_SRC: {source_file}:{source_start_line + i + 1}")
+            out.append(("    " * indent) + f"# NEOAK_SRC: {source_file}:{source_start_line + i}")
         out.append(("    " * indent) + line)
 
     i = 0
@@ -556,11 +529,7 @@ def _translate_block(body: str, instance: bool = False, field_names: set[str] | 
         m = re.match(r"}\s*else\s+if\s*\((.*)\)\s*{\s*$", line)
         if m:
             indent = max(0, indent - 1)
-            cond_src = m.group(1)
-            if instance:
-                cond_src = _replace_field_tokens(cond_src, field_names, locals_set)
-            lowered = _lower_assignment_in_cond(cond_src)
-            cond = _replace_literals_and_ops(lowered) if lowered is not None else _replace_literals_and_ops(cond_src)
+            cond = _replace_literals_and_ops(m.group(1))
             emit(f"elif {cond}:")
             indent += 1
             i += 1
@@ -588,8 +557,9 @@ def _translate_block(body: str, instance: bool = False, field_names: set[str] | 
             # Insert back into lines: header, inner statements (one per line), closing brace, then after
             insert = []
             insert.append(before)
-            if inner.strip():
-                insert.append(inner)
+            for stmt in _split_top_level_semicolons(inner):
+                if stmt.strip():
+                    insert.append(stmt.strip() + ';')
             insert.append('}')
             if after:
                 insert.append(after)
@@ -599,49 +569,12 @@ def _translate_block(body: str, instance: bool = False, field_names: set[str] | 
             continue
 
         # if / while headers
-        def _lower_assignment_in_cond(cond_src: str) -> Optional[str]:
-            # Return a Python condition string using walrus (:=) if assignment present; else None.
-            s = cond_src.strip()
-            # Pattern: (x = expr)
-            m_asg_only = re.match(r"^\(?\s*(\w+)\s*=\s*(.+)\s*\)?$", s)
-            if m_asg_only:
-                name = m_asg_only.group(1)
-                rhs = m_asg_only.group(2)
-                rhs_src = rhs
-                if instance:
-                    rhs_src = _replace_field_tokens(rhs_src, field_names, locals_set)
-                rhs_py = _maybe_rewrite_string_concat(rhs_src)
-                return f"({name} := {rhs_py})"
-            # Pattern: (x = expr) (==|!=) rhs2
-            m_asg_cmp = re.match(r"^\(\s*(\w+)\s*=\s*(.+?)\s*\)\s*(==|!=)\s*(.+)$", s)
-            if m_asg_cmp:
-                name = m_asg_cmp.group(1)
-                rhs1 = m_asg_cmp.group(2)
-                op = m_asg_cmp.group(3)
-                rhs2 = m_asg_cmp.group(4)
-                src1 = rhs1
-                src2 = rhs2
-                if instance:
-                    src1 = _replace_field_tokens(src1, field_names, locals_set)
-                    src2 = _replace_field_tokens(src2, field_names, locals_set)
-                rhs1_py = _maybe_rewrite_string_concat(src1)
-                rhs2_py = _replace_literals_and_ops(src2)
-                asg = f"{name} = {rhs1_py}"
-                # Handle None comparisons idiomatically
-                if rhs2_py == "None" and op == "!=":
-                    return f"(({name} := {rhs1_py}) is not None)"
-                if rhs2_py == "None" and op == "==":
-                    return f"(({name} := {rhs1_py}) is None)"
-                return f"(({name} := {rhs1_py}) {op} {rhs2_py})"
-            return None
-
         m = re.match(r"if\s*\((.*)\)\s*{\s*$", line)
         if m:
             cond_src = m.group(1)
             if instance:
                 cond_src = _replace_field_tokens(cond_src, field_names, locals_set)
-            lowered = _lower_assignment_in_cond(cond_src)
-            cond = _replace_literals_and_ops(lowered) if lowered is not None else _replace_literals_and_ops(cond_src)
+            cond = _replace_literals_and_ops(cond_src)
             emit(f"if {cond}:")
             indent += 1
             i += 1
@@ -652,8 +585,7 @@ def _translate_block(body: str, instance: bool = False, field_names: set[str] | 
             cond_src = m.group(1)
             if instance:
                 cond_src = _replace_field_tokens(cond_src, field_names, locals_set)
-            lowered = _lower_assignment_in_cond(cond_src)
-            cond = _replace_literals_and_ops(lowered) if lowered is not None else _replace_literals_and_ops(cond_src)
+            cond = _replace_literals_and_ops(cond_src)
             emit(f"while {cond}:")
             indent += 1
             i += 1
@@ -667,7 +599,6 @@ def _translate_block(body: str, instance: bool = False, field_names: set[str] | 
             brace = 1
             j = i + 1
             block_lines = []
-            # Track relative line indexes within the current method body
             while j < len(lines) and brace > 0:
                 ln = lines[j]
                 block_lines.append(ln)
@@ -679,17 +610,15 @@ def _translate_block(body: str, instance: bool = False, field_names: set[str] | 
             while block_lines and block_lines[-1].strip() == '}':
                 block_lines.pop()
             # Parse cases
-            cases = []  # list of (values:list[str] or None for default, body_lines:list[str], start_idx:int)
+            cases = []  # list of (values:list[str] or None for default, body_lines:list[str])
             cur_vals = None
             cur_body = []
-            cur_start = 0
             def flush():
-                nonlocal cur_vals, cur_body, cur_start
+                nonlocal cur_vals, cur_body
                 if cur_vals is not None or cur_body:
-                    cases.append((cur_vals, cur_body, cur_start))
+                    cases.append((cur_vals, cur_body))
                 cur_vals = None
                 cur_body = []
-                cur_start = 0
             k = 0
             while k < len(block_lines):
                 l2 = block_lines[k].strip()
@@ -699,11 +628,9 @@ def _translate_block(body: str, instance: bool = False, field_names: set[str] | 
                     flush()
                     val = mcase.group(1).strip()
                     cur_vals = [val]
-                    cur_start = k + 1
                 elif mdef:
                     flush()
                     cur_vals = []  # empty list marks default
-                    cur_start = k + 1
                 else:
                     # Stop current case on 'break;'
                     if l2 == 'break;' or l2 == 'break':
@@ -715,7 +642,7 @@ def _translate_block(body: str, instance: bool = False, field_names: set[str] | 
             # Merge fallthrough cases: fold empty-case bodies into the next non-empty body
             merged = []
             pending_vals = []
-            for vals, body_lines, start_idx in cases:
+            for vals, body_lines in cases:
                 if vals is None:
                     continue
                 if vals != [] and len([ln for ln in body_lines if ln.strip() and ln.strip() != 'break;' and ln.strip() != 'break']) == 0:
@@ -725,13 +652,13 @@ def _translate_block(body: str, instance: bool = False, field_names: set[str] | 
                 if vals != []:
                     vals = pending_vals + vals
                     pending_vals = []
-                merged.append((vals, body_lines, start_idx))
+                merged.append((vals, body_lines))
             cases = merged
 
             # Emit switch as if/elif/else
             emit(f"__sw = {switch_expr}")
             first = True
-            for vals, body_lines, start_idx in cases:
+            for vals, body_lines in cases:
                 if vals is None:
                     continue
                 if vals == []:
@@ -744,8 +671,7 @@ def _translate_block(body: str, instance: bool = False, field_names: set[str] | 
                     first = False
                 indent += 1
                 # translate body
-                base_line = (source_start_line + i + 1) if (source_start_line is not None and source_file) else None
-                inner = _translate_block("\n".join(body_lines), instance=instance, source_file=source_file, source_start_line=(base_line + start_idx if base_line is not None else None))
+                inner = _translate_block("\n".join(body_lines), instance=instance)
                 for inner_ln in inner.splitlines():
                     emit(inner_ln)
                 indent -= 1
@@ -782,7 +708,6 @@ def _translate_block(body: str, instance: bool = False, field_names: set[str] | 
                     name = mc.group(2).strip()
                     types = [t.strip() for t in typespec.split('|')]
                     # collect catch body
-                    catch_header_idx = j
                     j += 1
                     brace2 = 1
                     body2 = []
@@ -795,11 +720,10 @@ def _translate_block(body: str, instance: bool = False, field_names: set[str] | 
                     # remove trailing closing brace
                     while body2 and body2[-1].strip() == '}':
                         body2.pop()
-                    catches.append((types, name, body2, catch_header_idx + 1))
+                    catches.append((types, name, body2))
                     continue
                 elif mf:
                     # collect finally body
-                    finally_header_idx = j
                     j += 1
                     brace3 = 1
                     fbody = []
@@ -811,7 +735,7 @@ def _translate_block(body: str, instance: bool = False, field_names: set[str] | 
                         j += 1
                     while fbody and fbody[-1].strip() == '}':
                         fbody.pop()
-                    finally_lines = (fbody, finally_header_idx + 1)
+                    finally_lines = fbody
                     break
                 else:
                     # End of try-catch-finally
@@ -819,27 +743,23 @@ def _translate_block(body: str, instance: bool = False, field_names: set[str] | 
             # Emit Python try/except/finally
             emit("try:")
             indent += 1
-            base_line_try = (source_start_line + i + 1) if (source_start_line is not None and source_file) else None
-            inner = _translate_block("\n".join(try_lines), instance=instance, source_file=source_file, source_start_line=base_line_try)
+            inner = _translate_block("\n".join(try_lines), instance=instance)
             for inner_ln in inner.splitlines():
                 emit(inner_ln)
             indent -= 1
-            for types, name, body2, start_idx in catches:
+            for types, name, body2 in catches:
                 mapped = [_map_exception_name(t) for t in types] if types else ["Exception"]
                 types_py = ", ".join(mapped) if len(mapped) > 1 else (mapped[0])
                 emit(f"except ({types_py}) as {name}:") if len(mapped) > 1 else emit(f"except {types_py} as {name}:")
                 indent += 1
-                base_catch_line = (source_start_line + start_idx) if (source_start_line is not None and source_file) else None
-                inner2 = _translate_block("\n".join(body2), instance=instance, source_file=source_file, source_start_line=base_catch_line)
+                inner2 = _translate_block("\n".join(body2), instance=instance)
                 for inner_ln in inner2.splitlines():
                     emit(inner_ln)
                 indent -= 1
             if finally_lines is not None:
                 emit("finally:")
                 indent += 1
-                fbody, fstart = finally_lines
-                base_finally_line = (source_start_line + fstart) if (source_start_line is not None and source_file) else None
-                innerf = _translate_block("\n".join(fbody), instance=instance, source_file=source_file, source_start_line=base_finally_line)
+                innerf = _translate_block("\n".join(finally_lines), instance=instance)
                 for inner_ln in innerf.splitlines():
                     emit(inner_ln)
                 indent -= 1
@@ -879,8 +799,7 @@ def _translate_block(body: str, instance: bool = False, field_names: set[str] | 
                     cond_src = _replace_field_tokens(cond_src, field_names, locals_set)
                     upd_src = _replace_field_tokens(upd_src, field_names, locals_set)
                 pending_for_init = _translate_statement(init_src + ";")
-                lowered = _lower_assignment_in_cond(cond_src)
-                while_cond = _replace_literals_and_ops(lowered) if lowered is not None else _replace_literals_and_ops(cond_src)
+                while_cond = _replace_literals_and_ops(cond_src)
                 pending_for_update = _translate_statement(upd_src + ";")
                 if pending_for_init:
                     emit(pending_for_init)
@@ -910,22 +829,13 @@ def _translate_block(body: str, instance: bool = False, field_names: set[str] | 
             continue
 
         # Regular statement(s); may contain multiple semicolon-separated parts
-        # Enforce that non-empty, non-control lines contain at least one top-level semicolon
-        if line.strip() and not _has_top_level_semicolon(line):
-            # Compute best-effort source location
-            if source_file and source_start_line is not None:
-                where = f"{source_file}:{source_start_line + i + 1}"
-                ctx = f" (in {method_name})" if method_name else ""
-                raise ValueError(f"Missing semicolon at {where}{ctx}")
-            else:
-                ctx = f" (in {method_name})" if method_name else ""
-                raise ValueError(f"Missing semicolon{ctx}")
-
         stmts = _split_top_level_semicolons(line)
         for s in stmts:
             s = s.strip()
             if not s:
                 continue
+            if not s.endswith(';'):
+                s = s + ';'
             # Track method-scope locals from declarations
             decl_m = re.match(r"(?:final\s+)?(int|double|boolean|String|[A-Z][A-Za-z0-9_<>]*)(\[\])?\s+(\w+)\s*(?:=\s*(.*))?;\s*$", s)
             if decl_m:
@@ -942,8 +852,6 @@ class ClassSpec:
     def __init__(self, name: str):
         self.name = name
         self.base: Optional[str] = None
-        self.interfaces: List[str] = []
-        self.is_abstract: bool = False
         self.fields: List[Tuple[str, str, Optional[str]]] = []  # (type, name, init)
         # (ret, name, params, body, src_path, start_line)
         self.static_methods: List[Tuple[str, str, str, str, str, int]] = []
@@ -951,17 +859,6 @@ class ClassSpec:
         self.instance_methods: List[Tuple[str, str, str, str, str, int]] = []
         # list of (params, body, src_path, start_line)
         self.ctors: List[Tuple[str, str, str, int]] = []
-        # abstract method signatures declared without bodies
-        self.abstract_methods: List[Tuple[str, str, str, str, int]] = []  # (ret,name,params,src_path,start_line)
-        self.src_path: Optional[str] = None
-
-
-class InterfaceSpec:
-    def __init__(self, name: str, src_path: str):
-        self.name = name
-        self.src_path = src_path
-        self.extends: List[str] = []
-        self.methods: List[Tuple[str, str, str, int]] = []  # (ret,name,params,start_line)
 
 
 def _find_matching_brace(s: str, start_index: int) -> int:
@@ -981,60 +878,6 @@ def _find_matching_brace(s: str, start_index: int) -> int:
     return -1
 
 
-def _extract_interfaces(code: str) -> List[InterfaceSpec]:
-    interfaces: List[InterfaceSpec] = []
-    # Build file markers table
-    file_marks: List[Tuple[int, str]] = []
-    for m in re.finditer(r"^NEOAK_FILE:(.*)$", code, flags=re.M):
-        path = m.group(1).strip()
-        content_start = m.end()
-        if content_start < len(code) and code[content_start] == '\n':
-            content_start += 1
-        file_marks.append((content_start, path))
-    file_marks.sort(key=lambda x: x[0])
-
-    def find_src(pos: int) -> Tuple[str, int]:
-        current_path = "<unknown>"
-        start_idx = 0
-        for s, p in file_marks:
-            if s <= pos:
-                current_path = p
-                start_idx = s
-            else:
-                break
-        line_no = code[start_idx:pos].count('\n') + 1
-        return current_path, line_no
-
-    i = 0
-    n = len(code)
-    while i < n:
-        m = re.search(r"interface\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?:extends\s+([A-Za-z_][A-Za-z0-9_\.,\s]*))?\s*\{", code[i:])
-        if not m:
-            break
-        name = m.group(1)
-        extends = m.group(2)
-        body_start = i + m.end()
-        body_end = _find_matching_brace(code, body_start - 1)
-        if body_end == -1:
-            break
-        src_path, _ = find_src(body_start)
-        spec = InterfaceSpec(name, src_path)
-        if extends:
-            names = [nm.strip().split('.')[-1] for nm in extends.split(',') if nm.strip()]
-            spec.extends = names
-        body = code[body_start:body_end]
-        # Extract method signatures ending with ';'
-        for mm in re.finditer(r"(?m)^(?:public\s+)?(?:abstract\s+)?([A-Za-z_][A-Za-z0-9_<>,\[\]\.\?\s]+?)\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(([^)]*)\)\s*;\s*$", body):
-            rettype = mm.group(1).strip()
-            mname = mm.group(2)
-            params = mm.group(3).strip()
-            start_line = code[body_start: body_start + mm.start()].count('\n') + 1
-            spec.methods.append((rettype, mname, params, start_line))
-        interfaces.append(spec)
-        i = body_end + 1
-    return interfaces
-
-
 def _extract_classes(code: str) -> List[ClassSpec]:
     classes: List[ClassSpec] = []
     i = 0
@@ -1049,9 +892,6 @@ def _extract_classes(code: str) -> List[ClassSpec]:
         file_marks.append((content_start, path))
     file_marks.sort(key=lambda x: x[0])
 
-    if not file_marks:
-        file_marks.append((0, 'Main.java'))
-
     def find_src(pos: int) -> Tuple[str, int]:
         # Returns (path, line_number)
         current_path = "<unknown>"
@@ -1065,27 +905,18 @@ def _extract_classes(code: str) -> List[ClassSpec]:
         line_no = code[start_idx:pos].count('\n') + 1
         return current_path, line_no
     while i < n:
-        m = re.search(r"(abstract\s+)?class\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?:extends\s+([A-Za-z_][A-Za-z0-9_]*))?\s*(?:implements\s+([A-Za-z_][A-Za-z0-9_\.,\s]*))?\s*\{", code[i:])
+        m = re.search(r"class\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?:extends\s+([A-Za-z_][A-Za-z0-9_]*))?\s*\{", code[i:])
         if not m:
             break
-        is_abs = bool(m.group(1))
-        cls_name = m.group(2)
-        base_name = m.group(3)
-        impls = m.group(4)
+        cls_name = m.group(1)
+        base_name = m.group(2)
         body_start = i + m.end()
         body_end = _find_matching_brace(code, body_start - 1)
         if body_end == -1:
             break
         body = code[body_start:body_end]
-        # Determine source file for this class from the beginning of its body
-        class_src_path, _class_line = find_src(body_start)
         spec = ClassSpec(cls_name)
         spec.base = base_name
-        spec.is_abstract = is_abs
-        if impls:
-            names = [nm.strip().split('.')[-1] for nm in impls.split(',') if nm.strip()]
-            spec.interfaces = names
-        spec.src_path = class_src_path
 
         # Extract methods and constructors first to avoid mis-parsing fields
         j = 0
@@ -1112,10 +943,10 @@ def _extract_classes(code: str) -> List[ClassSpec]:
             chunk = body[hdr_end:blk_end]
             # Absolute index of header end in full code
             abs_hdr_end = body_start + hdr_end
-            _src_path, start_line = find_src(abs_hdr_end)
+            src_path, start_line = find_src(abs_hdr_end)
             if kind == 'ctor':
                 params = msel.group(2).strip()
-                spec.ctors.append((params, chunk, class_src_path, start_line))
+                spec.ctors.append((params, chunk, src_path, start_line))
             else:
                 # Using new pattern groups
                 # Static detection is tricky here; we infer static if 'this' is not used? too complex.
@@ -1126,13 +957,13 @@ def _extract_classes(code: str) -> List[ClassSpec]:
                 name = msel.group(2)
                 params = msel.group(3).strip()
                 if is_static:
-                    spec.static_methods.append((rettype, name, params, chunk, class_src_path, start_line))
+                    spec.static_methods.append((rettype, name, params, chunk, src_path, start_line))
                 else:
-                    spec.instance_methods.append((rettype, name, params, chunk, class_src_path, start_line))
+                    spec.instance_methods.append((rettype, name, params, chunk, src_path, start_line))
             removed_ranges.append((k, blk_end + 1))
             j = blk_end + 1
 
-        # Collect only top-level text (depth==0) for field parsing and abstract method signatures
+        # Collect only top-level text (depth==0) for field parsing
         top_level_chars = []
         depth = 0
         k = 0
@@ -1161,13 +992,6 @@ def _extract_classes(code: str) -> List[ClassSpec]:
                 name = mfield.group(5)
                 init = mfield.group(6).strip() if mfield.group(6) else None
                 spec.fields.append((typ, name, init))
-        # Scan for abstract methods declared without body in class
-        for mm in re.finditer(r"(?m)^(?:public|private|protected)?\s*abstract\s+([A-Za-z_][A-Za-z0-9_<>,\[\]\.\?\s]+?)\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(([^)]*)\)\s*;\s*$", leftover):
-            rettype = mm.group(1).strip()
-            mname = mm.group(2)
-            params = mm.group(3).strip()
-            start_line = code[body_start: body_start + mm.start()].count('\n') + 1
-            spec.abstract_methods.append((rettype, mname, params, class_src_path, start_line))
 
         classes.append(spec)
         i = body_end + 1
@@ -1215,8 +1039,6 @@ def _parse_params_detailed(param_str: str) -> List[Tuple[str, bool, str]]:
         name = re.sub(r"\[\]$", "", name)
         # Strip generic params
         typ = re.sub(r"<.*>", "", typ)
-        # Strip package qualification
-        typ = typ.split('.')[-1]
         res.append((typ, is_array, name))
     return res
 
@@ -1236,11 +1058,6 @@ def transpile(code: str) -> str:
     py_lines = [
         "# Generated by NeOak transpiler",
         "from typing import *",
-        "from abc import ABC, abstractmethod",
-        "import sys",
-        "__neoak_stdin = sys.stdin",
-        "__neoak_stderr = sys.stderr",
-        "from neoak.rt import Object, Class, Scanner, File",
         "def _neoak_strcat(*parts):\n    return ''.join(str(p) for p in parts)\n",
         "def _neoak_plus(*parts):\n    acc = None\n    for p in parts:\n        if acc is None:\n            acc = p\n        else:\n            if isinstance(acc, str) or isinstance(p, str):\n                acc = str(acc) + str(p)\n            else:\n                acc = acc + p\n    return acc\n",
         "def _neoak_is_type(x, t, arr=False):\n"
@@ -1261,43 +1078,7 @@ def transpile(code: str) -> str:
         "        return True\n",
     ]
 
-    interfaces = _extract_interfaces(code)
     classes = _extract_classes(code)
-
-    # Build file markers for source mapping within this function
-    file_marks: List[Tuple[int, str]] = []
-    for m in re.finditer(r"^NEOAK_FILE:(.*)$", code, flags=re.M):
-        path = m.group(1).strip()
-        content_start = m.end()
-        if content_start < len(code) and code[content_start] == '\n':
-            content_start += 1
-        file_marks.append((content_start, path))
-    file_marks.sort(key=lambda x: x[0])
-    if not file_marks:
-        file_marks.append((0, 'Main.java'))
-
-    def find_src_local(pos: int) -> Tuple[str, int]:
-        current_path = "<unknown>"
-        start_idx = 0
-        for s, p in file_marks:
-            if s <= pos:
-                current_path = p
-                start_idx = s
-            else:
-                break
-        line_no = code[start_idx:pos].count('\n') + 1
-        return current_path, line_no
-
-    # Enforce: abstract classes and interfaces cannot be instantiated
-    abstract_names = {c.name for c in classes if c.is_abstract or c.abstract_methods}
-    iface_names = {i.name for i in interfaces}
-    for m in re.finditer(r"new\s+([A-Za-z_][A-Za-z0-9_\.]*?)\s*\(", code):
-        qname = m.group(1)
-        short = qname.split('.')[-1]
-        if short in abstract_names or short in iface_names:
-            path, ln = find_src_local(m.start())
-            kind = 'interface' if short in iface_names else 'abstract class'
-            raise ValueError(f"Cannot instantiate {kind} {short} at {path}:{ln}")
     if not classes:
         raise ValueError("No classes found. Define at least one class with a static main method.")
 
@@ -1306,61 +1087,10 @@ def transpile(code: str) -> str:
     main_params = None
     main_body = None
 
-    # Emit interfaces first as ABCs
-    # Build extends graph for interfaces
-    iface_map: Dict[str, InterfaceSpec] = {i.name: i for i in interfaces}
-    for iface in interfaces:
-        bases = ["ABC"] + [base for base in iface.extends if base]
-        bases_str = ", ".join(dict.fromkeys(bases)) if bases else "ABC"
-        py_lines.append(f"class {iface.name}({bases_str}):")
-        if not iface.methods:
-            py_lines.append("    pass")
-        else:
-            for (ret, name, params, start_line) in iface.methods:
-                params_py, _ = _translate_params(params)
-                py_lines.append("    @abstractmethod")
-                py_lines.append(f"    def {name}(self, {params_py}):")
-                py_lines.append("        ...")
-        py_lines.append("")
-
-    # Helper: compute required interface methods (transitive)
-    def iface_required_methods(names: List[str]) -> set[Tuple[str, int]]:
-        req: set[Tuple[str, int]] = set()
-        seen = set()
-        stack = list(names)
-        while stack:
-            nm = stack.pop()
-            if nm in seen:
-                continue
-            seen.add(nm)
-            spec = iface_map.get(nm)
-            if not spec:
-                continue
-            for (_ret, mname, params, _ln) in spec.methods:
-                _, param_names = _translate_params(params)
-                req.add((mname, len(param_names)))
-            # include parents
-            for parent in spec.extends:
-                stack.append(parent)
-        return req
-
     # Generate Python classes
     for cls in classes:
-        bases: List[str] = []
-        if cls.base:
-            bases.append(cls.base)
-        else:
-            bases.append("Object")
-        # include interfaces as bases
-        for nm in cls.interfaces:
-            if nm not in bases:
-                bases.append(nm)
-        # Include ABC if class is abstract or declares abstract methods
-        if cls.is_abstract or cls.abstract_methods:
-            if "ABC" not in bases:
-                bases.append("ABC")
-        bases_str = ", ".join(dict.fromkeys(bases))
-        py_lines.append(f"class {cls.name}({bases_str}):")
+        base = cls.base if cls.base else "object"
+        py_lines.append(f"class {cls.name}({base}):")
         field_set = {name for (_typ, name, _init) in cls.fields}
         # __init__ with overload dispatch
         if cls.ctors:
@@ -1391,7 +1121,7 @@ def transpile(code: str) -> str:
                 if cls.base and 'super(' not in body:
                     py_lines.append("            super().__init__()")
                 ctor_param_names = [n for (_t, _arr, n) in details]
-                py_body = _translate_block(body, instance=True, field_names=field_set, param_names=ctor_param_names, class_name=cls.name, static_names={name for (_ret, name, _params, _body, *_extra) in cls.static_methods}, source_file=src_path, source_start_line=start_line, method_name=f"{cls.name}.{name}")
+                py_body = _translate_block(body, instance=True, field_names=field_set, param_names=ctor_param_names, class_name=cls.name, static_names={name for (_ret, name, _params, _body, *_extra) in cls.static_methods}, source_file=src_path, source_start_line=start_line)
                 py_lines.append("".join(["            " + ln if ln else ln for ln in py_body.splitlines(True)]))
                 py_lines.append("            return")
             py_lines.append("        raise TypeError('No matching constructor for given arguments')")
@@ -1409,14 +1139,6 @@ def transpile(code: str) -> str:
             else:
                 py_lines.append("        pass")
 
-        # Emit abstract methods declared without bodies
-        for (_ret, name, params, _src, _ln) in cls.abstract_methods:
-            params_py, _ = _translate_params(params)
-            py_lines.append("    @abstractmethod")
-            py_lines.append(f"    def {name}(self, {params_py}):")
-            py_lines.append("        ...")
-
-
         # Group methods by name for overloading
         inst_groups: Dict[str, List[Tuple[str, str, str, str, int]]] = {}
         for (ret, name, params, body, src_path, start_line) in cls.instance_methods:
@@ -1427,7 +1149,7 @@ def transpile(code: str) -> str:
                 params, body, _, src_path, start_line = overs[0]
                 params_py, _names = _translate_params(params)
                 py_lines.append(f"    def {name}(self, {params_py}):")
-                py_body = _translate_block(body, instance=True, field_names=field_set, param_names=_names, class_name=cls.name, static_names={name for (_ret, name, _params, _body, *_extra) in cls.static_methods}, source_file=src_path, source_start_line=start_line, method_name=f"{cls.name}.{name}")
+                py_body = _translate_block(body, instance=True, field_names=field_set, param_names=_names, class_name=cls.name, static_names={name for (_ret, name, _params, _body, *_extra) in cls.static_methods}, source_file=src_path, source_start_line=start_line)
                 py_lines.append("".join(["        " + ln if ln else ln for ln in py_body.splitlines(True)]))
             else:
                 # Create specific variants
@@ -1436,7 +1158,7 @@ def transpile(code: str) -> str:
                     params_py = ", ".join([n for (_, _, n) in details])
                     py_lines.append(f"    def {name}__ov{idx}(self, {params_py}):")
                     param_names = [n for (_t, _arr, n) in details]
-                    py_body = _translate_block(body, instance=True, field_names=field_set, param_names=param_names, class_name=cls.name, static_names={name for (_ret, name, _params, _body, *_extra) in cls.static_methods}, source_file=src_path, source_start_line=start_line, method_name=f"{cls.name}.{name}")
+                    py_body = _translate_block(body, instance=True, field_names=field_set, param_names=param_names, class_name=cls.name, static_names={name for (_ret, name, _params, _body, *_extra) in cls.static_methods}, source_file=src_path, source_start_line=start_line)
                     py_lines.append("".join(["        " + ln if ln else ln for ln in py_body.splitlines(True)]))
                 # Dispatcher
                 py_lines.append(f"    def {name}(self, *args):")
@@ -1457,7 +1179,7 @@ def transpile(code: str) -> str:
         # If class defines toString(), add __str__ alias for Python printing
         if 'toString' in inst_groups:
             # Find zero-arg variant if any
-            has_zero = any(len(_parse_params_detailed(p)) == 0 for (p, _b, _r, _src, _ln) in inst_groups['toString'])
+            has_zero = any(len(_parse_params_detailed(p)) == 0 for (p, _b, _r) in inst_groups['toString'])
             if has_zero:
                 py_lines.append("    def __str__(self):")
                 py_lines.append("        return self.toString()")
@@ -1473,7 +1195,7 @@ def transpile(code: str) -> str:
                 params_py, _names = _translate_params(params)
                 py_lines.append("    @staticmethod")
                 py_lines.append(f"    def {name}({params_py}):")
-                py_body = _translate_block(body, class_name=cls.name, static_names={name for (_ret, name, _params, _body, *_extra) in cls.static_methods}, source_file=src_path, source_start_line=start_line, method_name=f"{cls.name}.{name}")
+                py_body = _translate_block(body, class_name=cls.name, static_names={name for (_ret, name, _params, _body, *_extra) in cls.static_methods}, source_file=src_path, source_start_line=start_line)
                 py_lines.append("".join(["        " + ln if ln else ln for ln in py_body.splitlines(True)]))
                 if name == 'main':
                     main_found = True
@@ -1485,7 +1207,7 @@ def transpile(code: str) -> str:
                     params_py = ", ".join([n for (_, _, n) in details])
                     py_lines.append("    @staticmethod")
                     py_lines.append(f"    def {name}__ov{idx}({params_py}):")
-                    py_body = _translate_block(body, class_name=cls.name, static_names={name for (_ret, name, _params, _body, *_extra) in cls.static_methods}, source_file=src_path, source_start_line=start_line, method_name=f"{cls.name}.{name}")
+                    py_body = _translate_block(body, class_name=cls.name, static_names={name for (_ret, name, _params, _body, *_extra) in cls.static_methods}, source_file=src_path, source_start_line=start_line)
                     py_lines.append("".join(["        " + ln if ln else ln for ln in py_body.splitlines(True)]))
                 # Dispatcher
                 py_lines.append("    @staticmethod")
@@ -1508,23 +1230,6 @@ def transpile(code: str) -> str:
                     main_class_name = cls.name
 
         py_lines.append("")
-
-        # Enforcement: non-abstract class must implement all interface methods
-        if not (cls.is_abstract or cls.abstract_methods):
-            required = iface_required_methods(cls.interfaces)
-            provided: set[Tuple[str, int]] = set()
-            inst_groups_check: Dict[str, List[Tuple[str, str, str, str, int]]] = {}
-            for (ret, name, params, body, src_path, start_line) in cls.instance_methods:
-                inst_groups_check.setdefault(name, []).append((params, body, ret, src_path, start_line))
-            for name, overs in inst_groups_check.items():
-                for (params, _body, _ret, _src, _ln) in overs:
-                    _, pnames = _translate_params(params)
-                    provided.add((name, len(pnames)))
-            missing = required - provided
-            if missing:
-                missing_list = ", ".join([f"{n}/{a}" for (n, a) in sorted(missing)])
-                where = cls.src_path or '<unknown>'
-                raise ValueError(f"Class {cls.name} does not implement interface methods: {missing_list} (in {where})")
 
     if not main_found:
         raise ValueError("No static main method found. Expected: static void main(String[] args) { ... }")
@@ -1633,34 +1338,3 @@ def _split_top_level_semicolons(s: str) -> list[str]:
     if buf:
         parts.append(''.join(buf))
     return parts
-
-
-def _has_top_level_semicolon(s: str) -> bool:
-    depth = 0
-    in_str = False
-    str_ch = ''
-    i = 0
-    while i < len(s):
-        ch = s[i]
-        if in_str:
-            if ch == str_ch and (i == 0 or s[i - 1] != '\\'):
-                in_str = False
-            i += 1
-            continue
-        if ch in ('"', "'"):
-            in_str = True
-            str_ch = ch
-            i += 1
-            continue
-        if ch in '([{':
-            depth += 1
-            i += 1
-            continue
-        if ch in ')]}':
-            depth = max(0, depth - 1)
-            i += 1
-            continue
-        if ch == ';' and depth == 0:
-            return True
-        i += 1
-    return False
