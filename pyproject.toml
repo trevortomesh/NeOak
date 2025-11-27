@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "neoak"
+version = "0.1.0"
+description = "NeOak: Java-like transpiler runner without the JVM"
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [{ name = "NeOak Contributors" }]
+keywords = ["java", "transpiler", "language", "cli"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+]
+
+[project.scripts]
+neoak = "neoak.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["neoak*"]
+

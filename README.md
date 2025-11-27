@@ -1,2 +1,192 @@
 # NeOak
 The Oak Project Reborn
+
+<p align="center">
+  <picture>
+    <!-- Uncomment the next line and add logo-dark.png for dark mode -->
+    <!-- <source media="(prefers-color-scheme: dark)" srcset="logo-dark.png"> -->
+    <img alt="NeOak" src="logo.png" width="280">
+  </picture>
+  
+</p>
+
+## Overview
+
+NeOak is a tiny, experimental Java-like language that runs without the JVM by transpiling Java/NeOak sources to Python and executing them with Python 3. No JVM/JRE/JDK is required or invoked.
+
+Current feature set:
+- Class with `static` methods
+- `public static void main(String[] args)` entrypoint
+- `System.out.println(...)` and `System.out.print(...)`
+- `if` / `else if` / `else`, `while`, classic `for` loops, and `for-each` (`for (T x : xs) { ... }`)
+- Basic types: `int`, `double`, `boolean`, `String` (erased to Python types)
+- Arrays: `new int[n]`, `new T[]{...}`, `arr.length`, indexing, foreach
+- Operators: `&&`, `||`, `!`, `++/--` statements, `Math.max/min`
+- Safer `+` string concatenation when string literals are present
+
+Exceptions and control flow:
+- `try { ... } catch (A e) { ... } finally { ... }` (multi-catch with `A | B`)
+- `throw new E(args)` and `throw e`
+- `switch (expr)` with `case` and `default`, basic fall-through until `break;`
+
+Instance features:
+- Instance fields with optional initializers (primitive or expression)
+- Constructors: `public ClassName(args) { ... }` → `__init__(self, ...)`
+- `this` inside instance contexts maps to `self`
+- Object creation: `new ClassName(args)`
+- Instance methods callable as `obj.method(...)`
+- Unqualified calls to class static methods are allowed via top-level aliases
+
+Inheritance:
+- `class Sub extends Base { ... }` generates `class Sub(Base):`
+- `super(args)` in constructor maps to `super().__init__(args)`
+- `super.method(args)` maps to `super().method(args)`
+- If a subclass constructor exists and no explicit `super(...)` call is present, a best-effort `super().__init__()` is inserted
+
+Overloading:
+- Methods: multiple methods with the same name are supported via runtime dispatch on arity and basic types (boolean, int/double, String, lists for arrays, and class names).
+- Constructors: multiple constructors are supported; field initializers run first, then the matching constructor body executes.
+- Static methods: overloaded static methods dispatch similarly and remain callable as unqualified top-level functions.
+- Dispatch favors the first matching overload in declaration order.
+
+Projects and files:
+- Entry file can be `Main.nk`, `Main.nk.java`, or `Main.java`.
+- Place additional classes in separate files; runner loads all `.nk`, `.nk.java`, `.java` files recursively under the given directory.
+- `package ...;` and `import ...;` headers are parsed and ignored for now (no enforced package namespaces yet).
+
+## Quick Start
+
+1. Put a `Main.nk`, `Main.nk.java`, or `Main.java` somewhere under your project directory. You can place additional classes in separate files in the same directory or subdirectories (e.g., `src/app/Person.java`, `src/app/Student.java`). The runner auto-loads all `.nk`, `.nk.java`, and `.java` files recursively under the entry directory.
+2. Run the NeOak runner:
+
+- Installed CLI: `neoak` (searches current directory recursively)
+- Point at a directory (recursive): `neoak path/to/src`
+- Emit generated Python: `neoak --emit`
+- Local dev without install: `python3 neoak.py` or `python3 neoak.py path/to/src`
+
+## Installation
+
+Option 1 — pipx (recommended):
+- Ensure pipx is installed: `python3 -m pip install --user pipx && python3 -m pipx ensurepath`
+- Install from the repo root: `pipx install .`
+- Then run: `neoak`
+
+Option 2 — installer script:
+- From the repo root: `bash install.sh`
+- If `pipx` is not available, it falls back to `pip install --user .` and places the `neoak` script in `~/.local/bin`.
+
+Option 3 — pip (user):
+- `python3 -m pip install --user .`
+- Ensure `~/.local/bin` is on your PATH.
+
+Uninstall:
+- pipx: `pipx uninstall neoak`
+- pip: `python3 -m pip uninstall neoak`
+
+Optional: emit the transpiled Python instead of running:
+```
+neoak --emit
+```
+
+## Project Layout
+
+Example layout with packages for IDE compatibility:
+
+```
+src/
+  app/
+    Main.java        // package app;
+    Person.java      // package app;
+    Student.java     // package app;
+```
+
+- The CLI finds `Main.*` anywhere under the provided directory (default: current directory), in this order: `Main.nk` → `Main.nk.java` → `Main.java`.
+- All sibling `.nk`, `.nk.java`, and `.java` files under that directory tree are loaded.
+- Package/import lines are currently ignored by the transpiler, but keeping packages consistent helps IDEs.
+
+## Editor Setup (VS Code)
+
+- Ensure Java extension and a JDK are installed. In the Command Palette, run “Java: Configure Runtime” to pick a JDK.
+- Mark `src` as the source root by adding `.vscode/settings.json`:
+
+```
+{
+  "java.project.sourcePaths": ["src"],
+  "java.configuration.updateBuildConfiguration": "automatic"
+}
+```
+
+- Use a consistent package, e.g., put `package app;` at the top of all files under `src/app/`.
+- For Java tooling, prefer `.java`. NeOak also accepts `.nk` and `.nk.java` files but Java IDEs may not parse `.nk.java` semantics strictly.
+
+## Example (Main.nk)
+
+```
+class Main {
+    public static void main(String[] args) {
+        System.out.println("Hello from NeOak!");
+    }
+}
+
+// Example with instances
+class Person {
+    String name;
+    int age = 0;
+
+    public Person(String name, int age) {
+        this.name = name;
+        this.age = age;
+    }
+
+    public String describe() {
+        return this.name + ", " + this.age;
+    }
+}
+```
+
+## Notes
+
+- This is not a JVM. It transpiles to Python and executes with Python 3.
+- Unsupported constructs will likely cause a transpile error or unexpected behavior.
+- The goal is to iterate toward broader Java compatibility over time (and possibly add a native backend).
+
+Known limitations:
+- Overload resolution is best-effort at runtime (arity + coarse types); Java numeric promotions and boxing aren’t modeled.
+- `package` is ignored; no real namespacing yet (class name collisions across packages aren’t isolated).
+- No interfaces, abstract classes, enums, annotations, lambdas/streams.
+- Generics are ignored/erased; arrays are Python lists.
+- Not compatible with `.class`/`.jar` artifacts.
+
+## Why NeOak?
+
+- Simplicity: Run Java-like code with only Python installed.
+- Familiarity: Keep most of Java’s look-and-feel without the JVM.
+- Fast iteration: Transpile-and-run in one command; `--emit` for debugging.
+- Embeddable: Library-first design makes it easy to wire into tools.
+- Portable: No bytecode or native toolchains required to start.
+
+## Roadmap
+
+- Packages: Real package namespaces (map `package` to modules; avoid collisions).
+- Types: Better overload resolution and numeric promotions; boxing semantics.
+- OOP: Interfaces, abstract classes, enums, visibility hints.
+- Generics: Partial support (erasure-aware checks; array/generic bridges).
+- Stdlib: Common helpers (time, parsing, I/O) with Java-like facades.
+- Imports: Classpath-style discovery, selective file inclusion, wildcards.
+- Tooling: Improve errors, source maps in traces, `--check` static validation.
+- Performance: Cache transpilation outputs; incremental recompilation.
+- Packaging: Simple `pipx` install; optional Homebrew-style script.
+- Backend: Optional C++/native backend for compiled binaries.
+
+## Future Features
+
+- Packages/namespaces with proper module emission and collision avoidance.
+- Better overload resolution with numeric promotions and boxing semantics.
+- Interfaces, abstract classes, enums, annotations, and visibility hints.
+- Partial generics support (erasure-aware checks, array/generic bridges).
+- Standard library shims (time, parsing, I/O, collections) with Java-like APIs.
+- Imports/classpath: selective inclusion, wildcards, and dependency sets.
+- Diagnostics: improved error messages, source maps for tracebacks, `--check` mode.
+- Performance: transpilation cache, incremental builds, parallel file loading.
+- Debugger hooks and stepping aligned to source lines.
+- C++/native backend option for building standalone binaries.
