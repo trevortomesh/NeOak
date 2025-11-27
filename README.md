@@ -23,6 +23,7 @@ Current feature set:
 - Arrays: `new int[n]`, `new T[]{...}`, `arr.length`, indexing, foreach
 - Operators: `&&`, `||`, `!`, `++/--` statements, `Math.max/min`
 - Safer `+` string concatenation when string literals are present
+  - Plus semantics match Java: numeric addition until a string is encountered, then concatenation left-to-right (e.g., `1+2` → `3`, `"A"+2` → `"A2"`).
 
 Exceptions and control flow:
 - `try { ... } catch (A e) { ... } finally { ... }` (multi-catch with `A | B`)

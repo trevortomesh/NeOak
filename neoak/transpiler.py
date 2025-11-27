@@ -243,26 +243,15 @@ def _translate_statement(line: str) -> str:
     m = re.match(r"System\.out\.println\((.*)\)$", l)
     if m:
         inner = m.group(1).strip()
-        # Split on top-level plus to avoid Python's strict type concat
-        parts = _split_top_level_plus(inner)
-        parts = [
-            _replace_literals_and_ops(p.strip()) for p in parts if p.strip() != ''
-        ]
-        if len(parts) <= 1:
-            return f"print({parts[0] if parts else ''})"
-        return "print(" + ", ".join(parts) + ")"
+        expr = _maybe_rewrite_string_concat(inner)
+        return f"print({expr})"
 
     # System.out.print (no newline)
     m = re.match(r"System\.out\.print\((.*)\)$", l)
     if m:
         inner = m.group(1).strip()
-        parts = _split_top_level_plus(inner)
-        parts = [
-            _replace_literals_and_ops(p.strip()) for p in parts if p.strip() != ''
-        ]
-        if len(parts) <= 1:
-            return f"print({parts[0] if parts else ''}, end='')"
-        return "print(" + ", ".join(parts) + ", end='')"
+        expr = _maybe_rewrite_string_concat(inner)
+        return f"print({expr}, end='')"
 
     # Variable declarations with optional initializer
     m = re.match(
@@ -410,13 +399,56 @@ def _replace_super_tokens(s: str) -> str:
     return ''.join(out)
 
 
-def _translate_block(body: str, instance: bool = False) -> str:
+def _replace_field_tokens(s: str, field_names: set[str], locals_set: set[str]) -> str:
+    # Qualify bare field identifiers with self.<name> outside strings.
+    # Skip if already qualified (preceded by '.'), or if token is a known local/param.
+    if not field_names:
+        return s
+    out = []
+    i = 0
+    n = len(s)
+    in_str = False
+    str_ch = ''
+    while i < n:
+        ch = s[i]
+        if in_str:
+            out.append(ch)
+            if ch == str_ch and (i == 0 or s[i-1] != '\\'):
+                in_str = False
+            i += 1
+            continue
+        if ch in ('"', "'"):
+            in_str = True
+            str_ch = ch
+            out.append(ch)
+            i += 1
+            continue
+        if (ch.isalpha() or ch == '_'):
+            j = i+1
+            while j < n and (s[j].isalnum() or s[j] == '_'):
+                j += 1
+            tok = s[i:j]
+            prev = s[i-1] if i > 0 else ''
+            if tok in field_names and tok not in locals_set and prev != '.':
+                out.append('self.' + tok)
+            else:
+                out.append(tok)
+            i = j
+            continue
+        out.append(ch)
+        i += 1
+    return ''.join(out)
+
+
+def _translate_block(body: str, instance: bool = False, field_names: set[str] | None = None, param_names: list[str] | None = None) -> str:
     # Convert a Java-like block (no method/class signatures) into Python
     lines = [ln for ln in body.splitlines()]
     out: list[str] = []
     indent = 0
     pending_for_init = None
     pending_for_update = None
+    field_names = field_names or set()
+    locals_set: set[str] = set(param_names or [])
 
     def emit(line: str):
         if line is None:
@@ -432,6 +464,7 @@ def _translate_block(body: str, instance: bool = False) -> str:
             # Map 'this' and 'super' in instance contexts
             raw = _replace_this_tokens(raw)
             raw = _replace_super_tokens(raw)
+            raw = _replace_field_tokens(raw, field_names, locals_set)
             line = raw.strip()
 
         # Skip empty lines
@@ -486,7 +519,10 @@ def _translate_block(body: str, instance: bool = False) -> str:
         # if / while headers
         m = re.match(r"if\s*\((.*)\)\s*{\s*$", line)
         if m:
-            cond = _replace_literals_and_ops(m.group(1))
+            cond_src = m.group(1)
+            if instance:
+                cond_src = _replace_field_tokens(cond_src, field_names, locals_set)
+            cond = _replace_literals_and_ops(cond_src)
             emit(f"if {cond}:")
             indent += 1
             i += 1
@@ -494,7 +530,10 @@ def _translate_block(body: str, instance: bool = False) -> str:
 
         m = re.match(r"while\s*\((.*)\)\s*{\s*$", line)
         if m:
-            cond = _replace_literals_and_ops(m.group(1))
+            cond_src = m.group(1)
+            if instance:
+                cond_src = _replace_field_tokens(cond_src, field_names, locals_set)
+            cond = _replace_literals_and_ops(cond_src)
             emit(f"while {cond}:")
             indent += 1
             i += 1
@@ -679,7 +718,10 @@ def _translate_block(body: str, instance: bool = False) -> str:
         m = re.match(r"for\s*\(\s*(?:final\s+)?[A-Za-z_][A-Za-z0-9_<>\[\]]*\s+(\w+)\s*:\s*(.*)\)\s*\{\s*$", line)
         if m:
             var = m.group(1)
-            iterable = _replace_literals_and_ops(m.group(2).strip())
+            iter_src = m.group(2).strip()
+            if instance:
+                iter_src = _replace_field_tokens(iter_src, field_names, locals_set)
+            iterable = _replace_literals_and_ops(iter_src)
             emit(f"for {var} in {iterable}:")
             indent += 1
             i += 1
@@ -697,9 +739,16 @@ def _translate_block(body: str, instance: bool = False) -> str:
             # Fallback: attempt simple while-lowering for pattern: for (init; cond; update) {
             m_for = re.match(r"for\s*\(([^;]+);([^;]+);([^\)]+)\)\s*{\s*$", line)
             if m_for:
-                pending_for_init = _translate_statement(m_for.group(1).strip() + ";")
-                while_cond = _replace_literals_and_ops(m_for.group(2).strip())
-                pending_for_update = _translate_statement(m_for.group(3).strip() + ";")
+                init_src = m_for.group(1).strip()
+                cond_src = m_for.group(2).strip()
+                upd_src = m_for.group(3).strip()
+                if instance:
+                    init_src = _replace_field_tokens(init_src, field_names, locals_set)
+                    cond_src = _replace_field_tokens(cond_src, field_names, locals_set)
+                    upd_src = _replace_field_tokens(upd_src, field_names, locals_set)
+                pending_for_init = _translate_statement(init_src + ";")
+                while_cond = _replace_literals_and_ops(cond_src)
+                pending_for_update = _translate_statement(upd_src + ";")
                 if pending_for_init:
                     emit(pending_for_init)
                 emit(f"while {while_cond}:")
@@ -735,6 +784,10 @@ def _translate_block(body: str, instance: bool = False) -> str:
                 continue
             if not s.endswith(';'):
                 s = s + ';'
+            # Track method-scope locals from declarations
+            decl_m = re.match(r"(?:final\s+)?(int|double|boolean|String|[A-Z][A-Za-z0-9_<>]*)(\[\])?\s+(\w+)\s*(?:=\s*(.*))?;\s*$", s)
+            if decl_m:
+                locals_set.add(decl_m.group(3))
             py_stmt = _translate_statement(s)
             if py_stmt:
                 emit(py_stmt)
@@ -926,6 +979,7 @@ def transpile(code: str) -> str:
         "# Generated by NeOak transpiler",
         "from typing import *",
         "def _neoak_strcat(*parts):\n    return ''.join(str(p) for p in parts)\n",
+        "def _neoak_plus(*parts):\n    acc = None\n    for p in parts:\n        if acc is None:\n            acc = p\n        else:\n            if isinstance(acc, str) or isinstance(p, str):\n                acc = str(acc) + str(p)\n            else:\n                acc = acc + p\n    return acc\n",
         "def _neoak_is_type(x, t, arr=False):\n"
         "    if arr:\n"
         "        return isinstance(x, list)\n"
@@ -957,6 +1011,7 @@ def transpile(code: str) -> str:
     for cls in classes:
         base = cls.base if cls.base else "object"
         py_lines.append(f"class {cls.name}({base}):")
+        field_set = {name for (_typ, name, _init) in cls.fields}
         # __init__ with overload dispatch
         if cls.ctors:
             py_lines.append("    def __init__(self, *args):")
@@ -985,7 +1040,8 @@ def transpile(code: str) -> str:
                 # optional super call
                 if cls.base and 'super(' not in body:
                     py_lines.append("            super().__init__()")
-                py_body = _translate_block(body, instance=True)
+                ctor_param_names = [n for (_t, _arr, n) in details]
+                py_body = _translate_block(body, instance=True, field_names=field_set, param_names=ctor_param_names)
                 py_lines.append("".join(["            " + ln if ln else ln for ln in py_body.splitlines(True)]))
                 py_lines.append("            return")
             py_lines.append("        raise TypeError('No matching constructor for given arguments')")
@@ -1013,7 +1069,7 @@ def transpile(code: str) -> str:
                 params, body, _ = overs[0]
                 params_py, _names = _translate_params(params)
                 py_lines.append(f"    def {name}(self, {params_py}):")
-                py_body = _translate_block(body, instance=True)
+                py_body = _translate_block(body, instance=True, field_names=field_set, param_names=_names)
                 py_lines.append("".join(["        " + ln if ln else ln for ln in py_body.splitlines(True)]))
             else:
                 # Create specific variants
@@ -1021,7 +1077,8 @@ def transpile(code: str) -> str:
                     details = _parse_params_detailed(params)
                     params_py = ", ".join([n for (_, _, n) in details])
                     py_lines.append(f"    def {name}__ov{idx}(self, {params_py}):")
-                    py_body = _translate_block(body, instance=True)
+                    param_names = [n for (_t, _arr, n) in details]
+                    py_body = _translate_block(body, instance=True, field_names=field_set, param_names=param_names)
                     py_lines.append("".join(["        " + ln if ln else ln for ln in py_body.splitlines(True)]))
                 # Dispatcher
                 py_lines.append(f"    def {name}(self, *args):")
@@ -1156,12 +1213,9 @@ def _maybe_rewrite_string_concat(expr: str) -> str:
     parts = _split_top_level_plus(expr)
     if len(parts) <= 1:
         return _replace_literals_and_ops(expr)
-    # If any part contains a string literal, emit strcat
-    has_str_lit = any(re.search(r'(^|[^\\])([\'\"])', p) for p in parts)
+    # Use Java-like plus semantics at runtime: numeric addition unless a string is encountered
     parts = [_replace_literals_and_ops(p.strip()) for p in parts]
-    if has_str_lit:
-        return "_neoak_strcat(" + ", ".join(parts) + ")"
-    return " + ".join(parts)
+    return "_neoak_plus(" + ", ".join(parts) + ")"
 
 
 def _split_top_level_semicolons(s: str) -> list[str]:
