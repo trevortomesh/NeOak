@@ -2,6 +2,7 @@ README.md
 pyproject.toml
 neoak/__init__.py
 neoak/cli.py
+neoak/docsgen.py
 neoak/rt.py
 neoak/runner.py
 neoak/transpiler.py

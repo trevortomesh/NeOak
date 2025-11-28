@@ -33,7 +33,7 @@ Current feature set:
 - `if` / `else if` / `else`, `while`, classic `for` loops, and `for-each` (`for (T x : xs) { ... }`)
 - Basic types: `int`, `double`, `boolean`, `String` (erased to Python types)
 - Arrays: `new int[n]`, `new T[]{...}`, `arr.length`, indexing, foreach
-- Operators: `&&`, `||`, `!`, `++/--` statements, `Math.max/min`
+- Operators: `&&`, `||`, `!`, ternary `?:`, `++/--` statements, `Math.max/min`, `instanceof`, `obj.getClass() == T.class`
 - Safer `+` string concatenation when string literals are present
   - Plus semantics match Java: numeric addition until a string is encountered, then concatenation left-to-right (e.g., `1+2` → `3`, `"A"+2` → `"A2"`).
 
@@ -49,6 +49,10 @@ Instance features:
 - Object creation: `new ClassName(args)`
 - Instance methods callable as `obj.method(...)`
 - Unqualified calls to class static methods are allowed via top-level aliases
+
+Static members:
+- Static fields with initializers (class attributes).
+- Static initializer blocks (`static { ... }`) run once per class, after static field defaults.
 
 Inheritance:
 - `class Sub extends Base { ... }` generates `class Sub(Base):`
@@ -91,10 +95,11 @@ Projects and files:
 1. Put a `Main.nk`, `Main.nk.java`, or `Main.java` somewhere under your project directory. You can place additional classes in separate files in the same directory or subdirectories (e.g., `src/app/Person.java`, `src/app/Student.java`). The runner auto-loads all `.nk`, `.nk.java`, and `.java` files recursively under the entry directory.
 2. Run the NeOak runner:
 
-- Installed CLI: `neoak` (searches current directory recursively)
-- Point at a directory (recursive): `neoak path/to/src`
-- Emit generated Python: `neoak --emit`
-- Local dev without install: `python3 neoak.py` or `python3 neoak.py path/to/src`
+- Default run (current directory): `neoak run`
+- Run a specific path: `neoak run path/to/src`
+- Emit generated Python: `neoak run --emit`
+- Generate docs (JavaDoc‑style): `neoak docs path/to/src --out docs`
+- Local dev without install: `python3 neoak.py run` or `python3 neoak.py run path/to/src`
 
 ## Installation
 
@@ -117,7 +122,13 @@ Uninstall:
 
 Optional: emit the transpiled Python instead of running:
 ```
-neoak --emit
+neoak run --emit
+```
+
+Generate docs (JavaDoc-style):
+```
+neoak docs path/to/src --out docs
+open docs/index.html
 ```
 
 ## Project Layout
@@ -184,8 +195,8 @@ class Person {
 
 Known limitations:
 - Overload resolution is best-effort at runtime (arity + coarse types); Java numeric promotions and boxing aren’t modeled.
-- `package` is ignored; no real namespacing yet (class name collisions across packages aren’t isolated).
-- No interfaces, abstract classes, enums, annotations, lambdas/streams.
+- Packages: namespaces/imports are not emitted yet; package-private enforced at runtime for instance members (fields/methods). Static access checks are not enforced.
+- Interfaces and abstract classes are supported, but there are no interface default methods, no sealed hierarchies, and no nested/anonymous classes.
 - Generics: parsed and erased at runtime (no type-arg enforcement); arrays are Python lists.
 - Not compatible with `.class`/`.jar` artifacts.
 
@@ -227,6 +238,74 @@ class Main {
 Notes:
 - Requires Python Tkinter (usually included). If unavailable, graphics calls raise a runtime error.
 - Coordinates are pixel-based from top-left.
+
+## Reference (Early Draft)
+
+This section summarizes the current language and runtime surface area in a quick, JavaDocs‑style outline. It will evolve into a generated reference.
+
+Language
+- Classes: `class Name [extends Base] [implements I1, I2] { ... }`
+- Methods: `public|protected|private [static] T name(params) { ... }`
+- Constructors: `public|protected|private Name(params) { ... }`
+- Overloading: methods/constructors dispatched by arity + coarse types
+- Control flow: `if/else if/else`, `while`, classic `for`, `for-each`, `switch`, `try/catch/finally`
+- Operators: `&&`, `||`, `!`, ternary `?:`, `instanceof`, `getClass()==T.class`, `++/--` (statements), `+` with Java concat semantics
+- Exceptions: `throw`, multi‑catch; checked exceptions not enforced
+- Generics: parsed and erased at runtime (no wildcard/bounds enforcement)
+- Modifiers: `public/protected/private` enforced for instance methods/fields (see Notes); static access checks pending
+- Statics: static fields + `static {}` blocks
+
+Runtime API
+- `Object`
+  - `getClass(): Class`, `hashCode(): int`, `equals(Object): boolean`, `toString(): String`
+  - Concurrency helpers: `wait(timeout)`, `notify()`, `notifyAll()` (best‑effort)
+- `Class`
+  - `getName(): String`
+- `Scanner`
+  - `Scanner(String|Reader)`, `useDelimiter(String)`, `hasNext()`, `next()`, `nextLine()`, `nextInt()`, `nextDouble()`, `nextLong()`, `nextBoolean()`, `close()`
+- `File`
+  - `exists()`, `isDirectory()`, `isFile()`, `length()`, `lastModified()`, `getName()`, `getPath()`, `getAbsolutePath()`, `mkdir()`, `mkdirs()`, `list()`, `delete()`
+- `StdDraw` (graphics)
+  - `open(w,h,title)`, `clear([color])`, `setPenColor(name|r,g,b)`, `line(x0,y0,x1,y1)`, `circle(x,y,r)`, `filledCircle(x,y,r)`, `rectangle(x,y,w,h)`, `filledRectangle(x,y,w,h)`, `text(x,y,s)`, `show()`, `pause(ms)`, `close()`
+- Helpers (generated into output)
+  - `_neoak_plus(...)` for Java‑like `+` semantics, `_neoak_is_type(x,t,arr=False)` for overload checks
+
+Notes
+- Access control: instance `private/protected` is enforced via runtime checks; static members are not yet enforced. Package visibility is not modeled.
+- Arrays: Python lists; no runtime enforcement of generic element type.
+- Packages/imports: parsed but not enforced as namespaces yet.
+
+## Documentation Style (JavaDoc‑like)
+
+We plan to support JavaDoc‑style block comments and tags in NeOak sources and generate a reference site. Draft conventions:
+
+- Use `/** ... */` above classes and methods.
+- Supported tags (planned): `@param`, `@return`, `@throws`, `@since`, `@deprecated`, `@see`.
+
+Example:
+
+```
+/**
+ * A fast input scanner.
+ * @since 0.1
+ */
+class Scanner {
+    /**
+     * Reads next token delimited by the current pattern.
+     * @return next token as String
+     * @throws NoSuchElementException if input is exhausted
+     */
+    public String next() { ... }
+}
+```
+
+Generation Plan
+- Add a `neoak docs` subcommand that:
+  - Parses sources, extracts JavaDoc blocks, signatures, and tags
+  - Emits Markdown/HTML into `docs/` with a simple template (search + per‑symbol pages)
+  - Optionally links to source lines using existing `NEOAK_FILE` markers
+
+If you’d like, I can scaffold `neoak docs` with a minimal parser and a basic Markdown theme as a first step.
 
 ## Why NeOak?
 

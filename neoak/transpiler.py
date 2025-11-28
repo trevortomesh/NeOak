@@ -71,6 +71,27 @@ def _replace_literals_and_ops(expr: str) -> str:
             out.append('min')
             i += len('Math.min')
             continue
+        # instanceof mapping: <expr> instanceof Type or Type[]
+        m = re.match(r"([A-Za-z_][A-Za-z0-9_\.\[\]\(\)]*)\s+instanceof\s+([A-Za-z_][A-Za-z0-9_\.]*)(\[\])?", expr[i:])
+        if m:
+            lhs = m.group(1).strip()
+            rhs = m.group(2).strip()
+            is_arr = bool(m.group(3))
+            short = rhs.split('.')[-1]
+            out.append(f"_neoak_instanceof({lhs}, '{short}', {str(is_arr)})")
+            i += m.end()
+            continue
+        # getClass() == Type.class mapping
+        m = re.match(r"([A-Za-z_][A-Za-z0-9_\.\(\)]*)\.getClass\(\)\s*(==|!=)\s*([A-Za-z_][A-Za-z0-9_\.]*)\.class", expr[i:])
+        if m:
+            obj = m.group(1).strip()
+            op = m.group(2)
+            rhs = m.group(3).strip()
+            short = rhs.split('.')[-1]
+            chk = f"_neoak_class_is({obj}, '{short}')"
+            out.append(chk if op == '==' else f"(not {chk})")
+            i += m.end()
+            continue
         # System.in -> __neoak_stdin
         if expr.startswith('System.in', i):
             out.append('__neoak_stdin')
@@ -527,6 +548,46 @@ def _qualify_static_calls(s: str, class_name: str, static_names: set[str]) -> st
         i += 1
     return ''.join(out)
 
+def _qualify_class_static_refs(s: str, class_name: str, static_fields: set[str]) -> str:
+    # Replace bare static field tokens with ClassName.field outside strings and not already qualified
+    if not static_fields:
+        return s
+    out = []
+    i = 0
+    n = len(s)
+    in_str = False
+    str_ch = ''
+    while i < n:
+        ch = s[i]
+        if in_str:
+            out.append(ch)
+            if ch == str_ch and (i == 0 or s[i-1] != '\\'):
+                in_str = False
+            i += 1
+            continue
+        if ch in ('"', "'"):
+            in_str = True
+            str_ch = ch
+            out.append(ch)
+            i += 1
+            continue
+        if ch.isalpha() or ch == '_':
+            j = i+1
+            while j < n and (s[j].isalnum() or s[j] == '_'):
+                j += 1
+            tok = s[i:j]
+            prev = s[i-1] if i > 0 else ''
+            nxt = s[j] if j < n else ''
+            if tok in static_fields and prev != '.' and nxt != '.':
+                out.append(f"{class_name}.{tok}")
+            else:
+                out.append(tok)
+            i = j
+            continue
+        out.append(ch)
+        i += 1
+    return ''.join(out)
+
 
 def _translate_block(body: str, instance: bool = False, field_names: set[str] | None = None, param_names: list[str] | None = None, class_name: str | None = None, static_names: set[str] | None = None, source_file: str | None = None, source_start_line: int | None = None, method_name: str | None = None) -> str:
     # Convert a Java-like block (no method/class signatures) into Python
@@ -959,7 +1020,9 @@ class ClassSpec:
         self.base: Optional[str] = None
         self.interfaces: List[str] = []
         self.is_abstract: bool = False
+        self.pkg: Optional[str] = None
         self.fields: List[Tuple[str, str, Optional[str]]] = []  # (type, name, init)
+        self.static_fields: List[Tuple[str, str, Optional[str], str]] = []  # (type, name, init, access)
         # (ret, name, params, body, src_path, start_line)
         self.static_methods: List[Tuple[str, str, str, str, str, int]] = []
         # (ret, name, params, body, src_path, start_line)
@@ -973,6 +1036,8 @@ class ClassSpec:
         self.field_access: Dict[str, str] = {}  # name -> 'public'|'private'|'protected'
         self.inst_method_access: Dict[Tuple[str, str], str] = {}  # (name, params) -> access
         self.static_method_access: Dict[Tuple[str, str], str] = {}
+        # static initializer blocks: list of (body, src_path, start_line)
+        self.static_inits: List[Tuple[str, str, int]] = []
 
 
 class InterfaceSpec:
@@ -1066,6 +1131,7 @@ def _extract_classes(code: str) -> List[ClassSpec]:
     n = len(code)
     # Build file markers table for source mapping
     file_marks: List[Tuple[int, str]] = []  # (content_start_idx, path)
+    pkg_marks: List[Tuple[int, str]] = []   # (content_start_idx, pkg)
     for m in re.finditer(r"^NEOAK_FILE:(.*)$", code, flags=re.M):
         path = m.group(1).strip()
         content_start = m.end()
@@ -1073,6 +1139,13 @@ def _extract_classes(code: str) -> List[ClassSpec]:
             content_start += 1
         file_marks.append((content_start, path))
     file_marks.sort(key=lambda x: x[0])
+    for m in re.finditer(r"^NEOAK_PKG:(.*)$", code, flags=re.M):
+        pkg = m.group(1).strip()
+        content_start = m.end()
+        if content_start < len(code) and code[content_start] == '\n':
+            content_start += 1
+        pkg_marks.append((content_start, pkg))
+    pkg_marks.sort(key=lambda x: x[0])
 
     if not file_marks:
         file_marks.append((0, 'Main.java'))
@@ -1089,6 +1162,14 @@ def _extract_classes(code: str) -> List[ClassSpec]:
                 break
         line_no = code[start_idx:pos].count('\n') + 1
         return current_path, line_no
+    def find_pkg(pos: int) -> str:
+        current_pkg = '(default)'
+        for s, p in pkg_marks:
+            if s <= pos:
+                current_pkg = p
+            else:
+                break
+        return current_pkg
     while i < n:
         m = re.search(r"(abstract\s+)?class\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?:<[^>]*>)?\s*(?:extends\s+([A-Za-z_][A-Za-z0-9_\.]*(?:\s*<[^>]+>)?))?\s*(?:implements\s+([A-Za-z_][A-Za-z0-9_\.,\s<>&\[\]]*))?\s*\{", code[i:])
         if not m:
@@ -1102,8 +1183,9 @@ def _extract_classes(code: str) -> List[ClassSpec]:
         if body_end == -1:
             break
         body = code[body_start:body_end]
-        # Determine source file for this class from the beginning of its body
+        # Determine source file and package for this class from the beginning of its body
         class_src_path, _class_line = find_src(body_start)
+        class_pkg = find_pkg(body_start)
         spec = ClassSpec(cls_name)
         if base_name:
             bn = _strip_generics_balanced(base_name).strip()
@@ -1111,6 +1193,7 @@ def _extract_classes(code: str) -> List[ClassSpec]:
         else:
             spec.base = base_name
         spec.is_abstract = is_abs
+        spec.pkg = class_pkg
         if impls:
             raw_names = [nm for nm in _split_top_level_commas(impls) if nm.strip()]
             names = []
@@ -1158,8 +1241,10 @@ def _extract_classes(code: str) -> List[ClassSpec]:
                 header_text = body[k:hdr_end]
                 is_static = ' static ' in f' {header_text} '
                 # Access modifier
-                access = 'public'
-                if ' private ' in f' {header_text} ':
+                access = 'package'
+                if ' public ' in f' {header_text} ':
+                    access = 'public'
+                elif ' private ' in f' {header_text} ':
                     access = 'private'
                 elif ' protected ' in f' {header_text} ':
                     access = 'protected'
@@ -1190,7 +1275,7 @@ def _extract_classes(code: str) -> List[ClassSpec]:
                     top_level_chars.append(ch)
             k += 1
         leftover = ''.join(top_level_chars)
-        # Scan for field declarations (non-static) at top-level
+        # Scan for field declarations (non-static and static) at top-level
         for decl in leftover.split(';'):
             d = decl.strip()
             if not d:
@@ -1204,8 +1289,57 @@ def _extract_classes(code: str) -> List[ClassSpec]:
                 name = mfield.group(5)
                 init = mfield.group(6).strip() if mfield.group(6) else None
                 spec.fields.append((typ, name, init))
-                acc = mfield.group(1) or 'public'
+                acc_mod = (mfield.group(1) or '').strip()
+                acc = acc_mod if acc_mod in ('public','private','protected') else 'package'
                 spec.field_access[name] = acc
+            # static fields
+            mstatic = re.match(r"(public|private|protected)?\s*static\s+(final\s+)?(int|double|boolean|String|[A-Za-z_][A-Za-z0-9_\.]*(?:\s*<[^>]+>)?)(\[\])?\s+(\w+)\s*(?:=\s*(.*))?$", d)
+            if mstatic:
+                acc = (mstatic.group(1) or 'package').strip()
+                acc = acc if acc in ('public','private','protected') else 'package'
+                typ = mstatic.group(3)
+                name = mstatic.group(5)
+                init = mstatic.group(6).strip() if mstatic.group(6) else None
+                spec.static_fields.append((typ, name, init, acc))
+            else:
+                # Heuristic: detect missing semicolon for a top-level field declaration
+                first_line = d.splitlines()[0].strip()
+                if '(' in first_line:
+                    # looks like a method signature; ignore here
+                    pass
+                else:
+                    mstart = re.match(r"(public|private|protected)?\s*(final\s+)?(int|double|boolean|String|[A-Za-z_][A-Za-z0-9_\.]*(?:\s*<[^>]+>)?)(\[\])?\s+\w+\s*(?:=\s*[^;]+)?\s*$", first_line)
+                    if mstart and ' static ' not in first_line:
+                        pos_in_body = body.find(first_line)
+                        if pos_in_body >= 0:
+                            abs_pos = body_start + pos_in_body
+                            where_path, where_line = find_src(abs_pos)
+                            raise ValueError(f"Missing semicolon at {where_path}:{where_line} (in {cls_name} field declaration)")
+        # Find static initializer blocks at top-level in body
+        j2 = 0
+        depth2 = 0
+        while j2 < len(body):
+            ch2 = body[j2]
+            if ch2 == '{':
+                depth2 += 1
+                j2 += 1
+                continue
+            if ch2 == '}':
+                depth2 = max(0, depth2 - 1)
+                j2 += 1
+                continue
+            if depth2 == 0 and body.startswith('static', j2):
+                mblk = re.match(r"static\s*\{", body[j2:])
+                if mblk:
+                    brace_pos = j2 + mblk.end() - 1
+                    blk_end = _find_matching_brace(body, brace_pos)
+                    if blk_end != -1:
+                        blk_body = body[brace_pos+1:blk_end]
+                        _src_path, start_line = find_src(body_start + brace_pos + 1)
+                        spec.static_inits.append((blk_body, class_src_path, start_line))
+                        j2 = blk_end + 1
+                        continue
+            j2 += 1
         # Scan for abstract methods declared without body in class
         for mm in re.finditer(r"(?m)^(?:public|private|protected)?\s*abstract\s+([A-Za-z_][A-Za-z0-9_<>,\[\]\.\?\s]+?)\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(([^)]*)\)\s*;\s*$", leftover):
             rettype = mm.group(1).strip()
@@ -1287,6 +1421,19 @@ def transpile(code: str) -> str:
         "__neoak_stdin = sys.stdin",
         "__neoak_stderr = sys.stderr",
         "from neoak.rt import Object, Class, Scanner, File, StdDraw, Color",
+        "import threading\n",
+        "__neoak_tls = threading.local()\n",
+        "def _neoak_pkg_push(pkg):\n"
+        "    st = getattr(__neoak_tls, 'stack', [])\n"
+        "    st.append(pkg)\n"
+        "    __neoak_tls.stack = st\n",
+        "def _neoak_pkg_pop():\n"
+        "    st = getattr(__neoak_tls, 'stack', [])\n"
+        "    if st: st.pop()\n"
+        "    __neoak_tls.stack = st\n",
+        "def _neoak_pkg_current():\n"
+        "    st = getattr(__neoak_tls, 'stack', [])\n"
+        "    return st[-1] if st else None\n",
         "def _neoak_strcat(*parts):\n    return ''.join(str(p) for p in parts)\n",
         "def _neoak_plus(*parts):\n    acc = None\n    for p in parts:\n        if acc is None:\n            acc = p\n        else:\n            if isinstance(acc, str) or isinstance(p, str):\n                acc = str(acc) + str(p)\n            else:\n                acc = acc + p\n    return acc\n",
         "def _neoak_is_type(x, t, arr=False):\n"
@@ -1305,6 +1452,60 @@ def transpile(code: str) -> str:
         "        return isinstance(x, cls) if cls else True\n"
         "    except Exception:\n"
         "        return True\n",
+        "def _neoak_instanceof(x, t, arr=False):\n"
+        "    if arr:\n"
+        "        return isinstance(x, list)\n"
+        "    if t == 'boolean':\n"
+        "        return isinstance(x, bool)\n"
+        "    if t == 'String':\n"
+        "        return isinstance(x, str)\n"
+        "    if t == 'int':\n"
+        "        return isinstance(x, int) and not isinstance(x, bool)\n"
+        "    if t == 'double':\n"
+        "        return (isinstance(x, float) or (isinstance(x, int) and not isinstance(x, bool)))\n"
+        "    try:\n"
+        "        cls = globals().get(t)\n"
+        "        return isinstance(x, cls) if cls else False\n"
+        "    except Exception:\n"
+        "        return False\n",
+        "def _neoak_class_is(x, t):\n"
+        "    try:\n"
+        "        cls = globals().get(t)\n"
+        "        if cls:\n"
+        "            return isinstance(x, cls)\n"
+        "        return getattr(getattr(x, '__class__', object), '__name__', None) == t\n"
+        "    except Exception:\n"
+        "        return False\n",
+        "def _neoak_allow_package(pkg):\n"
+        "    cur = _neoak_pkg_current()\n"
+        "    if cur == pkg:\n"
+        "        return True\n"
+        "    f = inspect.currentframe().f_back\n"
+        "    while f:\n"
+        "        loc = f.f_locals\n"
+        "        ctx = loc.get('__neo_pkg_context', None)\n"
+        "        if ctx == pkg:\n"
+        "            return True\n"
+        "        f = f.f_back\n"
+        "    return False\n",
+        "def _neoak_allow_pkg_field(pkg):\n"
+        "    cur = _neoak_pkg_current()\n"
+        "    if cur == pkg:\n"
+        "        return True\n"
+        "    f = inspect.currentframe().f_back\n"
+        "    while f:\n"
+        "        loc = f.f_locals\n"
+        "        ctx = loc.get('__neo_pkg_context', None)\n"
+        "        if ctx == pkg:\n"
+        "            return True\n"
+        "        s = loc.get('self', None)\n"
+        "        try:\n"
+        "            if s is not None and getattr(s.__class__, '__neo_pkg', None) == pkg:\n"
+        "                return True\n"
+        "        except Exception:\n"
+        "            pass\n"
+        "        f = f.f_back\n"
+        "    return False\n",
         # Access control helpers (instance-level)
         "def _neoak_allow_private(owner):\n"
         "    f = inspect.currentframe().f_back\n"
@@ -1429,18 +1630,33 @@ def transpile(code: str) -> str:
                 bases.append("ABC")
         bases_str = ", ".join(dict.fromkeys(bases))
         py_lines.append(f"class {cls.name}({bases_str}):")
+        pkg_literal = (cls.pkg or '(default)').replace("'", "\'")
+        py_lines.append(f"    _neo_pkg = '{pkg_literal}'")
         field_set = {name for (_typ, name, _init) in cls.fields}
+        # Emit static field defaults as class attributes (simple semantics)
+        for (typ, name, init, _acc) in cls.static_fields:
+            if init is not None:
+                init_py = _maybe_rewrite_string_concat(init)
+                py_lines.append(f"    {name} = {init_py}")
+            else:
+                defaults = {'int': '0', 'double': '0.0', 'boolean': 'False', 'String': "''"}
+                py_lines.append(f"    {name} = {defaults.get(typ, 'None')}")
         # __init__ with overload dispatch
         if cls.ctors:
             py_lines.append("    def __init__(self, *args):")
-            # Field defaults first
+            pkg_literal = (cls.pkg or '(default)').replace("'", "\'")
+            py_lines.append(f"        __neo_pkg_context = '{pkg_literal}'")
+            py_lines.append(f"        _neoak_pkg_push('{pkg_literal}')")
+            py_lines.append("        try:")
+            # Field defaults first (write backing store to avoid access checks during init)
             for (typ, name, init) in cls.fields:
+                backing = f"__neo_field_{name}"
                 if init is not None:
                     init_py = _maybe_rewrite_string_concat(init)
-                    py_lines.append(f"        self.{name} = {init_py}")
+                    py_lines.append(f"            setattr(self, '{backing}', {init_py})")
                 else:
                     defaults = {'int': '0', 'double': '0.0', 'boolean': 'False', 'String': "''"}
-                    py_lines.append(f"        self.{name} = {defaults.get(typ, 'None')}")
+                    py_lines.append(f"            setattr(self, '{backing}', {defaults.get(typ, 'None')})")
             # Overload branches
             for (params, body, src_path, start_line) in cls.ctors:
                 details = _parse_params_detailed(params)
@@ -1451,36 +1667,45 @@ def transpile(code: str) -> str:
                     type_checks.append(f"_neoak_is_type(args[{idx}], '{t}', {str(is_arr)})")
                 if type_checks:
                     cond.append(" and ".join(type_checks))
-                py_lines.append(f"        if {' and '.join(cond)}:")
+                py_lines.append(f"            if {' and '.join(cond)}:")
                 # param bindings
                 for idx, (_, _, name) in enumerate(details):
-                    py_lines.append(f"            {name} = args[{idx}]")
+                    py_lines.append(f"                {name} = args[{idx}]")
                 # optional super call
                 if cls.base and 'super(' not in body:
-                    py_lines.append("            super().__init__()")
+                    py_lines.append("                super().__init__()")
                 ctor_param_names = [n for (_t, _arr, n) in details]
                 py_body = _translate_block(body, instance=True, field_names=field_set, param_names=ctor_param_names, class_name=cls.name, static_names={name for (_ret, name, _params, _body, *_extra) in cls.static_methods}, source_file=src_path, source_start_line=start_line, method_name=f"{cls.name}.__init__")
-                py_lines.append("".join(["            " + ln if ln else ln for ln in py_body.splitlines(True)]))
-                py_lines.append("            return")
-            py_lines.append("        raise TypeError('No matching constructor for given arguments')")
+                py_lines.append("".join(["                " + ln if ln else ln for ln in py_body.splitlines(True)]))
+                py_lines.append("                return")
+            py_lines.append("            raise TypeError('No matching constructor for given arguments')")
+            py_lines.append("        finally:")
+            py_lines.append("            _neoak_pkg_pop()")
         else:
             py_lines.append("    def __init__(self):")
+            pkg_literal = (cls.pkg or '(default)').replace("'", "\'")
+            py_lines.append(f"        __neo_pkg_context = '{pkg_literal}'")
+            py_lines.append(f"        _neoak_pkg_push('{pkg_literal}')")
+            py_lines.append("        try:")
             for (typ, name, init) in cls.fields:
+                backing = f"__neo_field_{name}"
                 if init is not None:
                     init_py = _maybe_rewrite_string_concat(init)
-                    py_lines.append(f"        self.{name} = {init_py}")
+                    py_lines.append(f"            setattr(self, '{backing}', {init_py})")
                 else:
                     defaults = {'int': '0', 'double': '0.0', 'boolean': 'False', 'String': "''"}
-                    py_lines.append(f"        self.{name} = {defaults.get(typ, 'None')}")
+                    py_lines.append(f"            setattr(self, '{backing}', {defaults.get(typ, 'None')})")
             if cls.base:
-                py_lines.append("        super().__init__()")
+                py_lines.append("            super().__init__()")
             else:
-                py_lines.append("        pass")
+                py_lines.append("            pass")
+            py_lines.append("        finally:")
+            py_lines.append("            _neoak_pkg_pop()")
 
-        # Define properties for private/protected instance fields
+        # Define properties for private/protected/package instance fields
         for (typ, name, _init) in cls.fields:
-            acc = cls.field_access.get(name, 'public')
-            if acc in ('private', 'protected'):
+            acc = cls.field_access.get(name, 'package')
+            if acc in ('private', 'protected', 'package'):
                 # Backing storage name
                 backing = f"__neo_field_{name}"
                 # Getter
@@ -1488,8 +1713,10 @@ def transpile(code: str) -> str:
                 py_lines.append(f"    def {name}(self):")
                 if acc == 'private':
                     py_lines.append(f"        if not _neoak_allow_private({cls.name}):")
-                else:
+                elif acc == 'protected':
                     py_lines.append(f"        if not _neoak_allow_protected({cls.name}):")
+                else:
+                    py_lines.append(f"        if not _neoak_allow_pkg_field('{pkg_literal}'):")
                 py_lines.append(f"            raise PermissionError('IllegalAccessError: {acc} field {name}')")
                 py_lines.append(f"        return getattr(self, '{backing}', None)")
                 # Setter
@@ -1497,8 +1724,10 @@ def transpile(code: str) -> str:
                 py_lines.append(f"    def {name}(self, value):")
                 if acc == 'private':
                     py_lines.append(f"        if not _neoak_allow_private({cls.name}):")
-                else:
+                elif acc == 'protected':
                     py_lines.append(f"        if not _neoak_allow_protected({cls.name}):")
+                else:
+                    py_lines.append(f"        if not _neoak_allow_pkg_field('{pkg_literal}'):")
                 py_lines.append(f"            raise PermissionError('IllegalAccessError: {acc} field {name}')")
                 py_lines.append(f"        setattr(self, '{backing}', value)")
 
@@ -1520,6 +1749,9 @@ def transpile(code: str) -> str:
                 params, body, _, src_path, start_line = overs[0]
                 params_py, _names = _translate_params(params)
                 py_lines.append(f"    def {name}(self, {params_py}):")
+                py_lines.append(f"        __neo_pkg_context = '{pkg_literal}'")
+                py_lines.append(f"        _neoak_pkg_push('{pkg_literal}')")
+                py_lines.append("        try:")
                 # Access enforcement for instance methods
                 access = cls.inst_method_access.get((name, params), 'public')
                 if access in ('private', 'protected'):
@@ -1528,19 +1760,32 @@ def transpile(code: str) -> str:
                     else:
                         py_lines.append(f"        if not _neoak_allow_protected({cls.name}):")
                     py_lines.append(f"            raise PermissionError('IllegalAccessError: {access} method {name}')")
+                elif access == 'package':
+                    py_lines.append(f"        if not _neoak_allow_package('{pkg_literal}'):")
+                    py_lines.append(f"            raise PermissionError('IllegalAccessError: package-private method {name}')")
                 py_body = _translate_block(body, instance=True, field_names=field_set, param_names=_names, class_name=cls.name, static_names={name for (_ret, name, _params, _body, *_extra) in cls.static_methods}, source_file=src_path, source_start_line=start_line, method_name=f"{cls.name}.{name}")
-                py_lines.append("".join(["        " + ln if ln else ln for ln in py_body.splitlines(True)]))
+                py_lines.append("".join(["            " + ln if ln else ln for ln in py_body.splitlines(True)]))
+                py_lines.append("        finally:")
+                py_lines.append("            _neoak_pkg_pop()")
             else:
                 # Create specific variants
                 for idx, (params, body, _, src_path, start_line) in enumerate(overs):
                     details = _parse_params_detailed(params)
                     params_py = ", ".join([n for (_, _, n) in details])
                     py_lines.append(f"    def {name}__ov{idx}(self, {params_py}):")
+                    py_lines.append(f"        __neo_pkg_context = '{pkg_literal}'")
+                    py_lines.append(f"        _neoak_pkg_push('{pkg_literal}')")
+                    py_lines.append("        try:")
                     param_names = [n for (_t, _arr, n) in details]
                     py_body = _translate_block(body, instance=True, field_names=field_set, param_names=param_names, class_name=cls.name, static_names={name for (_ret, name, _params, _body, *_extra) in cls.static_methods}, source_file=src_path, source_start_line=start_line, method_name=f"{cls.name}.{name}")
-                    py_lines.append("".join(["        " + ln if ln else ln for ln in py_body.splitlines(True)]))
+                    py_lines.append("".join(["            " + ln if ln else ln for ln in py_body.splitlines(True)]))
+                    py_lines.append("        finally:")
+                    py_lines.append("            _neoak_pkg_pop()")
                 # Dispatcher
                 py_lines.append(f"    def {name}(self, *args):")
+                py_lines.append(f"        __neo_pkg_context = '{pkg_literal}'")
+                py_lines.append(f"        _neoak_pkg_push('{pkg_literal}')")
+                py_lines.append("        try:")
                 # Determine most restrictive access across overloads
                 most = 'public'
                 for params, _body, _ret, _src, _ln in overs:
@@ -1550,12 +1795,17 @@ def transpile(code: str) -> str:
                         break
                     if acc == 'protected' and most != 'private':
                         most = 'protected'
+                    if acc == 'package' and most not in ('private','protected'):
+                        most = 'package'
                 if most in ('private', 'protected'):
                     if most == 'private':
                         py_lines.append(f"        if not _neoak_allow_private({cls.name}):")
                     else:
                         py_lines.append(f"        if not _neoak_allow_protected({cls.name}):")
                     py_lines.append(f"            raise PermissionError('IllegalAccessError: {most} method {name}')")
+                elif most == 'package':
+                    py_lines.append(f"        if not _neoak_allow_package('{pkg_literal}'):")
+                    py_lines.append(f"            raise PermissionError('IllegalAccessError: package-private method {name}')")
                 for idx, (params, _body, _ret, _src, _ln) in enumerate(overs):
                     details = _parse_params_detailed(params)
                     arity = len(details)
@@ -1569,6 +1819,8 @@ def transpile(code: str) -> str:
                     call_args = ", ".join([f"args[{i}]" for i in range(arity)])
                     py_lines.append(f"            return self.{name}__ov{idx}({call_args})")
                 py_lines.append("        raise TypeError('No matching overload for method')")
+                py_lines.append("        finally:")
+                py_lines.append("            _neoak_pkg_pop()")
 
         # If class defines toString(), add __str__ alias for Python printing
         if 'toString' in inst_groups:
@@ -1589,9 +1841,18 @@ def transpile(code: str) -> str:
                 params_py, _names = _translate_params(params)
                 py_lines.append("    @staticmethod")
                 py_lines.append(f"    def {name}({params_py}):")
-                # Note: static method access modifiers are not strictly enforced yet
+                py_lines.append(f"        __neo_pkg_context = '{pkg_literal}'")
+                py_lines.append(f"        _neoak_pkg_push('{pkg_literal}')")
+                py_lines.append("        try:")
+                # Access enforcement for static methods (package/private/protected not fully modeled; support package here)
+                access = cls.static_method_access.get((name, params), 'public')
+                if access == 'package':
+                    py_lines.append(f"        if not _neoak_allow_package('{pkg_literal}'):")
+                    py_lines.append(f"            raise PermissionError('IllegalAccessError: package-private method {name}')")
                 py_body = _translate_block(body, class_name=cls.name, static_names={name for (_ret, name, _params, _body, *_extra) in cls.static_methods}, source_file=src_path, source_start_line=start_line, method_name=f"{cls.name}.{name}")
-                py_lines.append("".join(["        " + ln if ln else ln for ln in py_body.splitlines(True)]))
+                py_lines.append("".join(["            " + ln if ln else ln for ln in py_body.splitlines(True)]))
+                py_lines.append("        finally:")
+                py_lines.append("            _neoak_pkg_pop()")
                 if name == 'main':
                     main_found = True
                     main_class_name = cls.name
@@ -1602,12 +1863,28 @@ def transpile(code: str) -> str:
                     params_py = ", ".join([n for (_, _, n) in details])
                     py_lines.append("    @staticmethod")
                     py_lines.append(f"    def {name}__ov{idx}({params_py}):")
+                    py_lines.append(f"        __neo_pkg_context = '{pkg_literal}'")
+                    py_lines.append(f"        _neoak_pkg_push('{pkg_literal}')")
+                    py_lines.append("        try:")
                     py_body = _translate_block(body, class_name=cls.name, static_names={name for (_ret, name, _params, _body, *_extra) in cls.static_methods}, source_file=src_path, source_start_line=start_line, method_name=f"{cls.name}.{name}")
-                    py_lines.append("".join(["        " + ln if ln else ln for ln in py_body.splitlines(True)]))
+                    py_lines.append("".join(["            " + ln if ln else ln for ln in py_body.splitlines(True)]))
+                    py_lines.append("        finally:")
+                    py_lines.append("            _neoak_pkg_pop()")
                 # Dispatcher
                 py_lines.append("    @staticmethod")
                 py_lines.append(f"    def {name}(*args):")
-                # Note: static method access modifiers are not strictly enforced yet
+                py_lines.append(f"        __neo_pkg_context = '{pkg_literal}'")
+                py_lines.append(f"        _neoak_pkg_push('{pkg_literal}')")
+                py_lines.append("        try:")
+                # Determine most restrictive access across overloads for static methods
+                most = 'public'
+                for params, _body, _ret, _src, _ln in overs:
+                    acc = cls.static_method_access.get((name, params), 'public')
+                    if acc == 'package' and most == 'public':
+                        most = 'package'
+                if most == 'package':
+                    py_lines.append(f"        if not _neoak_allow_package('{pkg_literal}'):")
+                    py_lines.append(f"            raise PermissionError('IllegalAccessError: package-private method {name}')")
                 for idx, (params, _body, _ret, _src, _ln) in enumerate(overs):
                     details = _parse_params_detailed(params)
                     arity = len(details)
@@ -1621,11 +1898,37 @@ def transpile(code: str) -> str:
                     call_args = ", ".join([f"args[{i}]" for i in range(arity)])
                     py_lines.append(f"            return {cls.name}.{name}__ov{idx}({call_args})")
                 py_lines.append("        raise TypeError('No matching overload for static method')")
+                py_lines.append("        finally:")
+                py_lines.append("            _neoak_pkg_pop()")
                 if name == 'main':
                     main_found = True
                     main_class_name = cls.name
 
         py_lines.append("")
+        # Emit class static initializer that runs once
+        if cls.static_inits:
+            py_lines.append("    @staticmethod")
+            py_lines.append("    def _neoak_clinit():")
+            py_lines.append(f"        __neo_pkg_context = '{pkg_literal}'")
+            py_lines.append(f"        _neoak_pkg_push('{pkg_literal}')")
+            py_lines.append("        try:")
+            # After static fields defaulting above, execute blocks
+            for (blk_body, src_path, start_line) in cls.static_inits:
+                # Qualify static field refs inside the block
+                static_field_names = [n for (_t, n, _i, _a) in cls.static_fields]
+                pre = _qualify_class_static_refs(blk_body, cls.name, set(static_field_names))
+                py_body = _translate_block(pre, class_name=cls.name, static_names={name for (_ret, name, _params, _body, *_extra) in cls.static_methods}, source_file=src_path, source_start_line=start_line, method_name=f"{cls.name}.__clinit__")
+                # Extra safety: prefix bare static names in emitted Python
+                for n in static_field_names:
+                    py_body = re.sub(rf"(?<![\\w\\.]){re.escape(n)}(?![\\w\\.])", f"{cls.name}.{n}", py_body)
+                py_lines.append("".join(["            " + ln if ln else ln for ln in py_body.splitlines(True)]))
+            py_lines.append("        finally:")
+            py_lines.append("            _neoak_pkg_pop()")
+            py_lines.append("")
+        # Call static initializer if present
+        if cls.static_inits:
+            py_lines.append(f"{cls.name}._neoak_clinit()")
+            py_lines.append("")
 
         # Enforcement: non-abstract class must implement all interface methods
         if not (cls.is_abstract or cls.abstract_methods):
@@ -1770,6 +2073,19 @@ def _strip_generics_balanced(t: str) -> str:
 
 def _maybe_rewrite_string_concat(expr: str) -> str:
     expr = expr.strip()
+    # Ternary rewrite first: cond ? a : b -> (a if cond else b)
+    new_expr = _rewrite_ternary(expr)
+    if new_expr is not None:
+        expr = new_expr
+    # Replace getClass() == Type.class patterns early
+    def _sub_getclass(m):
+        obj = m.group(1).strip()
+        op = m.group(2)
+        rhs = m.group(3).strip()
+        short = rhs.split('.')[-1]
+        chk = f"_neoak_class_is({obj}, '{short}')"
+        return chk if op == '==' else f"(not {chk})"
+    expr = re.sub(r"([A-Za-z_][A-Za-z0-9_\.\(\)]*)\.getClass\(\)\s*(==|!=)\s*([A-Za-z_][A-Za-z0-9_\.]*)\.class", _sub_getclass, expr)
     # If the expression is an assignment like x = a + b, rewrite RHS only
     m = re.match(r"^(.*?=)(.*)$", expr)
     if m:
@@ -1783,6 +2099,72 @@ def _maybe_rewrite_string_concat(expr: str) -> str:
     # Use Java-like plus semantics at runtime: numeric addition unless a string is encountered
     parts = [_replace_literals_and_ops(p.strip()) for p in parts]
     return "_neoak_plus(" + ", ".join(parts) + ")"
+
+
+def _rewrite_ternary(expr: str) -> Optional[str]:
+    # Rewrites a single top-level ternary to Python form. Returns None if no ternary at top level.
+    # Handles nesting and parentheses; does not parse inside strings.
+    if '?' not in expr:
+        return None
+    depth = 0
+    in_str = False
+    str_ch = ''
+    q_idx = -1
+    # find top-level '?'
+    for i, ch in enumerate(expr):
+        if in_str:
+            if ch == str_ch and expr[i-1] != '\\':
+                in_str = False
+            continue
+        if ch in ('"', "'"):
+            in_str = True
+            str_ch = ch
+            continue
+        if ch in '([{':
+            depth += 1
+            continue
+        if ch in ')]}':
+            depth = max(0, depth - 1)
+            continue
+        if ch == '?' and depth == 0:
+            q_idx = i
+            break
+    if q_idx == -1:
+        return None
+    # find matching ':' at same depth
+    depth = 0
+    in_str = False
+    str_ch = ''
+    colon_idx = -1
+    for i in range(q_idx + 1, len(expr)):
+        ch = expr[i]
+        if in_str:
+            if ch == str_ch and expr[i-1] != '\\':
+                in_str = False
+            continue
+        if ch in ('"', "'"):
+            in_str = True
+            str_ch = ch
+            continue
+        if ch in '([{':
+            depth += 1
+            continue
+        if ch in ')]}':
+            depth = max(0, depth - 1)
+            continue
+        if ch == ':' and depth == 0:
+            colon_idx = i
+            break
+    if colon_idx == -1:
+        return None
+    cond = expr[:q_idx].strip()
+    tru = expr[q_idx + 1:colon_idx].strip()
+    fal = expr[colon_idx + 1:].strip()
+    # Recursively handle nested ternaries in parts and run literal/operator replacements in the next stage
+    cond_py = _replace_literals_and_ops(cond)
+    tru_py = _maybe_rewrite_string_concat(tru)
+    fal_py = _maybe_rewrite_string_concat(fal)
+    return f"(({tru_py}) if ({cond_py}) else ({fal_py}))"
 
 
 def _split_top_level_semicolons(s: str) -> list[str]:

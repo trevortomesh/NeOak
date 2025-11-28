@@ -3,6 +3,7 @@ import sys
 import tempfile
 import traceback
 from pathlib import Path
+import re
 
 from .transpiler import transpile
 
@@ -51,7 +52,16 @@ def _gather_sources(entry: Path) -> str:
     # Project files only (stdlib stubs are for IDEs; not injected into transpilation)
     for p in files:
         rel = str(p.relative_to(base_dir))
-        parts.append(f"/* NEOAK_FILE: {rel} */\n" + p.read_text(encoding="utf-8"))
+        text = p.read_text(encoding="utf-8")
+        # Extract package name if present (on a single line near top)
+        pkg = None
+        m = re.search(r"^\s*package\s+([^;]+);", text, flags=re.M)
+        if m:
+            pkg = m.group(1).strip()
+        else:
+            pkg = "(default)"
+        # Insert plain markers that survive comment stripping
+        parts.append(f"NEOAK_FILE:{rel}\nNEOAK_PKG:{pkg}\n" + text)
     # No need to re-insert main; it is already part of files
     return "\n\n".join(parts)
 

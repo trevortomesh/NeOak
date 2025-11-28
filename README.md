@@ -21,9 +21,19 @@ Current feature set:
 - `if` / `else if` / `else`, `while`, classic `for` loops, and `for-each` (`for (T x : xs) { ... }`)
 - Basic types: `int`, `double`, `boolean`, `String` (erased to Python types)
 - Arrays: `new int[n]`, `new T[]{...}`, `arr.length`, indexing, foreach
-- Operators: `&&`, `||`, `!`, `++/--` statements, `Math.max/min`
+- Operators: `&&`, `||`, `!`, ternary `?:`, `++/--` statements, `Math.max/min`, `instanceof`, `obj.getClass() == T.class`
 - Safer `+` string concatenation when string literals are present
   - Plus semantics match Java: numeric addition until a string is encountered, then concatenation left-to-right (e.g., `1+2` → `3`, `"A"+2` → `"A2"`).
+
+## What's New
+
+- Generics parsing with runtime erasure: supports declarations, params, foreach, and headers; no type-arg enforcement.
+- Access modifiers (instance): `private`/`protected` enforced; package-private enforced for instance methods/fields within same package.
+- Statics: static fields and `static {}` initializer blocks (run once per class).
+- Operators: ternary `?:`, `instanceof`, and `getClass() == T.class` rewrites.
+- Graphics: tiny `StdDraw` wrapper (Tkinter) for quick demos.
+- Docs: `neoak docs` generates lightweight JavaDoc-style HTML (index, packages, per-class pages).
+- Diagnostics: missing semicolons detected across all files with accurate `file:line`; abstract/interface rules checked.
 
 Exceptions and control flow:
 - `try { ... } catch (A e) { ... } finally { ... }` (multi-catch with `A | B`)
@@ -37,6 +47,10 @@ Instance features:
 - Object creation: `new ClassName(args)`
 - Instance methods callable as `obj.method(...)`
 - Unqualified calls to class static methods are allowed via top-level aliases
+
+Static members:
+- Static fields with initializers (class attributes).
+- Static initializer blocks (`static { ... }`) run once per class, after static field defaults.
 
 Inheritance:
 - `class Sub extends Base { ... }` generates `class Sub(Base):`
@@ -179,8 +193,8 @@ class Person {
 
 Known limitations:
 - Overload resolution is best-effort at runtime (arity + coarse types); Java numeric promotions and boxing aren’t modeled.
-- `package` is ignored; no real namespacing yet (class name collisions across packages aren’t isolated).
-- No interfaces, abstract classes, enums, annotations, lambdas/streams.
+- Packages: namespaces/imports are not emitted yet; package-private enforced at runtime for instance members (fields/methods). Static access checks are not enforced.
+- Interfaces and abstract classes are supported, but there are no interface default methods, no sealed hierarchies, and no nested/anonymous classes.
 - Generics: parsed and erased at runtime (no type-arg enforcement); arrays are Python lists.
 - Not compatible with `.class`/`.jar` artifacts.
 
@@ -233,10 +247,11 @@ Language
 - Constructors: `public|protected|private Name(params) { ... }`
 - Overloading: methods/constructors dispatched by arity + coarse types
 - Control flow: `if/else if/else`, `while`, classic `for`, `for-each`, `switch`, `try/catch/finally`
-- Operators: `&&`, `||`, `!`, `++/--` (statements), `+` with Java concat semantics
+- Operators: `&&`, `||`, `!`, ternary `?:`, `instanceof`, `getClass()==T.class`, `++/--` (statements), `+` with Java concat semantics
 - Exceptions: `throw`, multi‑catch; checked exceptions not enforced
 - Generics: parsed and erased at runtime (no wildcard/bounds enforcement)
-- Modifiers: `public/protected/private` enforced for instance methods/fields (see Notes); static enforcement pending
+- Modifiers: `public/protected/private` enforced for instance methods/fields (see Notes); static access checks pending
+- Statics: static fields + `static {}` blocks
 
 Runtime API
 - `Object`
