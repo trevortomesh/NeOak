@@ -110,12 +110,27 @@ def _replace_literals_and_ops(expr: str) -> str:
             out.append("[" + ", ".join(parts) + "]")
             i += m.end()
             continue
+        # new java.io.Foo<...>(...) or any dotted type with generics -> Foo(...)
+        m = re.match(r"new\s+([A-Za-z_][A-Za-z0-9_\.]*?)\s*<[^>]*>\s*\(", expr[i:])
+        if m:
+            qname = m.group(1)
+            short = qname.split('.')[-1]
+            out.append(short + '(')
+            i += m.end()
+            continue
         # new java.io.Foo(...) or any dotted type -> Foo(...)
         m = re.match(r"new\s+([A-Za-z_][A-Za-z0-9_\.]*?)\s*\(", expr[i:])
         if m:
             qname = m.group(1)
             short = qname.split('.')[-1]
             out.append(short + '(')
+            i += m.end()
+            continue
+        # new ClassName<...>(args) -> ClassName(args)
+        m = re.match(r"new\s+([A-Za-z_][A-Za-z0-9_]*)\s*<[^>]*>\s*\(", expr[i:])
+        if m:
+            cls = m.group(1)
+            out.append(cls + '(')
             i += m.end()
             continue
         # new ClassName(args) -> ClassName(args)
@@ -281,9 +296,9 @@ def _translate_statement(line: str) -> str:
         expr = _maybe_rewrite_string_concat(inner)
         return f"print({expr}, end='')"
 
-    # Variable declarations with optional initializer
+    # Variable declarations with optional initializer (support generics and qualification)
     m = re.match(
-        r"(?:final\s+)?(int|double|boolean|String|[A-Za-z_][A-Za-z0-9_<>]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)(\[\])?\s+(\w+)\s*(?:=\s*(.*))?$",
+        r"(?:final\s+)?((?:int|double|boolean|String|[A-Za-z_][A-Za-z0-9_]*)(?:\.[A-Za-z_][A-Za-z0-9_]*)*(?:\s*<[^>]+>)?)(\[\])?\s+(\w+)\s*(?:=\s*(.*))?$",
         l,
     )
     if m:
@@ -846,8 +861,8 @@ def _translate_block(body: str, instance: bool = False, field_names: set[str] | 
             i = j
             continue
 
-        # for-each header: for (Type name : expr) {
-        m = re.match(r"for\s*\(\s*(?:final\s+)?[A-Za-z_][A-Za-z0-9_<>\[\]]*\s+(\w+)\s*:\s*(.*)\)\s*\{\s*$", line)
+        # for-each header: for (Type name : expr) {  (support generics)
+        m = re.match(r"for\s*\(\s*(?:final\s+)?[A-Za-z_][A-Za-z0-9_\.]*(?:\s*<[^>]+>)?(?:\[\])?\s+(\w+)\s*:\s*(.*)\)\s*\{\s*$", line)
         if m:
             var = m.group(1)
             iter_src = m.group(2).strip()
@@ -927,7 +942,7 @@ def _translate_block(body: str, instance: bool = False, field_names: set[str] | 
             if not s:
                 continue
             # Track method-scope locals from declarations
-            decl_m = re.match(r"(?:final\s+)?(int|double|boolean|String|[A-Z][A-Za-z0-9_<>]*)(\[\])?\s+(\w+)\s*(?:=\s*(.*))?;\s*$", s)
+            decl_m = re.match(r"(?:final\s+)?(int|double|boolean|String|[A-Z][A-Za-z0-9_\.]*(?:\s*<[^>]+>)?)(\[\])?\s+(\w+)\s*(?:=\s*(.*))?;\s*$", s)
             if decl_m:
                 locals_set.add(decl_m.group(3))
             py_stmt = _translate_statement(s)
@@ -954,6 +969,10 @@ class ClassSpec:
         # abstract method signatures declared without bodies
         self.abstract_methods: List[Tuple[str, str, str, str, int]] = []  # (ret,name,params,src_path,start_line)
         self.src_path: Optional[str] = None
+        # Access modifiers
+        self.field_access: Dict[str, str] = {}  # name -> 'public'|'private'|'protected'
+        self.inst_method_access: Dict[Tuple[str, str], str] = {}  # (name, params) -> access
+        self.static_method_access: Dict[Tuple[str, str], str] = {}
 
 
 class InterfaceSpec:
@@ -1008,7 +1027,7 @@ def _extract_interfaces(code: str) -> List[InterfaceSpec]:
     i = 0
     n = len(code)
     while i < n:
-        m = re.search(r"interface\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?:extends\s+([A-Za-z_][A-Za-z0-9_\.,\s]*))?\s*\{", code[i:])
+        m = re.search(r"interface\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?:<[^>]*>)?\s*(?:extends\s+([A-Za-z_][A-Za-z0-9_\.,\s<>&\[\]]*))?\s*\{", code[i:])
         if not m:
             break
         name = m.group(1)
@@ -1020,7 +1039,13 @@ def _extract_interfaces(code: str) -> List[InterfaceSpec]:
         src_path, _ = find_src(body_start)
         spec = InterfaceSpec(name, src_path)
         if extends:
-            names = [nm.strip().split('.')[-1] for nm in extends.split(',') if nm.strip()]
+            raw_names = [nm for nm in _split_top_level_commas(extends) if nm.strip()]
+            names = []
+            for nm in raw_names:
+                base = _strip_generics_balanced(nm).strip()
+                base = base.split('.')[-1]
+                if base:
+                    names.append(base)
             spec.extends = names
         body = code[body_start:body_end]
         # Extract method signatures ending with ';'
@@ -1065,7 +1090,7 @@ def _extract_classes(code: str) -> List[ClassSpec]:
         line_no = code[start_idx:pos].count('\n') + 1
         return current_path, line_no
     while i < n:
-        m = re.search(r"(abstract\s+)?class\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?:extends\s+([A-Za-z_][A-Za-z0-9_]*))?\s*(?:implements\s+([A-Za-z_][A-Za-z0-9_\.,\s]*))?\s*\{", code[i:])
+        m = re.search(r"(abstract\s+)?class\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?:<[^>]*>)?\s*(?:extends\s+([A-Za-z_][A-Za-z0-9_\.]*(?:\s*<[^>]+>)?))?\s*(?:implements\s+([A-Za-z_][A-Za-z0-9_\.,\s<>&\[\]]*))?\s*\{", code[i:])
         if not m:
             break
         is_abs = bool(m.group(1))
@@ -1080,10 +1105,20 @@ def _extract_classes(code: str) -> List[ClassSpec]:
         # Determine source file for this class from the beginning of its body
         class_src_path, _class_line = find_src(body_start)
         spec = ClassSpec(cls_name)
-        spec.base = base_name
+        if base_name:
+            bn = _strip_generics_balanced(base_name).strip()
+            spec.base = bn.split('.')[-1]
+        else:
+            spec.base = base_name
         spec.is_abstract = is_abs
         if impls:
-            names = [nm.strip().split('.')[-1] for nm in impls.split(',') if nm.strip()]
+            raw_names = [nm for nm in _split_top_level_commas(impls) if nm.strip()]
+            names = []
+            for nm in raw_names:
+                base = _strip_generics_balanced(nm).strip()
+                base = base.split('.')[-1]
+                if base:
+                    names.append(base)
             spec.interfaces = names
         spec.src_path = class_src_path
 
@@ -1094,7 +1129,7 @@ def _extract_classes(code: str) -> List[ClassSpec]:
             # Constructor and methods
             ctor_pat = re.compile((r"(public|private|protected)?\s*" + re.escape(cls_name) + r"\s*\(([^)]*)\)\s*\{"))
             mc = ctor_pat.search(body[j:])
-            mm = re.search(r"(?:(?:public|private|protected)\s+)?(?:static\s+)?(?!public\b|private\b|protected\b)([A-Za-z_][A-Za-z0-9_<>\[\]]*)\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(([^)]*)\)\s*\{", body[j:])
+            mm = re.search(r"(?:(?:public|private|protected)\s+)?(?:static\s+)?(?!public\b|private\b|protected\b)([A-Za-z_][A-Za-z0-9_\.]*?(?:\s*<[^>]+>)?(?:\[\])?)\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(([^)]*)\)\s*\{", body[j:])
             # Choose earliest
             candidates = []
             if mc:
@@ -1122,13 +1157,21 @@ def _extract_classes(code: str) -> List[ClassSpec]:
                 # Instead, detect 'static' by peeking at header text
                 header_text = body[k:hdr_end]
                 is_static = ' static ' in f' {header_text} '
+                # Access modifier
+                access = 'public'
+                if ' private ' in f' {header_text} ':
+                    access = 'private'
+                elif ' protected ' in f' {header_text} ':
+                    access = 'protected'
                 rettype = msel.group(1)
                 name = msel.group(2)
                 params = msel.group(3).strip()
                 if is_static:
                     spec.static_methods.append((rettype, name, params, chunk, class_src_path, start_line))
+                    spec.static_method_access[(name, params)] = access
                 else:
                     spec.instance_methods.append((rettype, name, params, chunk, class_src_path, start_line))
+                    spec.inst_method_access[(name, params)] = access
             removed_ranges.append((k, blk_end + 1))
             j = blk_end + 1
 
@@ -1155,12 +1198,14 @@ def _extract_classes(code: str) -> List[ClassSpec]:
             # skip blocks or lines with braces
             if '{' in d or '}' in d:
                 continue
-            mfield = re.match(r"(public|private|protected)?\s*(final\s+)?(int|double|boolean|String|[A-Za-z_][A-Za-z0-9_<>]*)(\[\])?\s+(\w+)\s*(?:=\s*(.*))?$", d)
+            mfield = re.match(r"(public|private|protected)?\s*(final\s+)?(int|double|boolean|String|[A-Za-z_][A-Za-z0-9_\.]*(?:\s*<[^>]+>)?)(\[\])?\s+(\w+)\s*(?:=\s*(.*))?$", d)
             if mfield and ' static ' not in d:
                 typ = mfield.group(3)
                 name = mfield.group(5)
                 init = mfield.group(6).strip() if mfield.group(6) else None
                 spec.fields.append((typ, name, init))
+                acc = mfield.group(1) or 'public'
+                spec.field_access[name] = acc
         # Scan for abstract methods declared without body in class
         for mm in re.finditer(r"(?m)^(?:public|private|protected)?\s*abstract\s+([A-Za-z_][A-Za-z0-9_<>,\[\]\.\?\s]+?)\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(([^)]*)\)\s*;\s*$", leftover):
             rettype = mm.group(1).strip()
@@ -1177,17 +1222,16 @@ def _extract_classes(code: str) -> List[ClassSpec]:
 def _translate_params(param_str: str) -> Tuple[str, list[str]]:
     if not param_str or param_str.strip() == "":
         return "", []
-    params = []
-    names = []
-    for p in param_str.split(","):
-        p = p.strip()
-        if not p:
+    params: list[str] = []
+    names: list[str] = []
+    for p in _split_top_level_commas(param_str):
+        s = p.strip()
+        if not s:
             continue
-        # Remove array brackets and generics naively
-        parts = p.split()
-        name = parts[-1]
-        # Remove trailing [] if present
-        name = re.sub(r"\[\]$", "", name)
+        mname = re.search(r"(\w+)\s*(\[\])?\s*$", s)
+        if not mname:
+            continue
+        name = mname.group(1)
         params.append(name)
         names.append(name)
     return ", ".join(params), names
@@ -1198,26 +1242,27 @@ def _parse_params_detailed(param_str: str) -> List[Tuple[str, bool, str]]:
     res: List[Tuple[str, bool, str]] = []
     if not param_str or param_str.strip() == "":
         return res
-    for p in param_str.split(','):
-        p = p.strip()
-        if not p:
+    for p in _split_top_level_commas(param_str):
+        s = p.strip()
+        if not s:
             continue
-        parts = p.split()
-        if len(parts) < 2:
-            # Fallback
-            name = parts[-1]
-            res.append(("Object", False, name))
+        mname = re.search(r"(\w+)\s*(\[\])?\s*$", s)
+        if not mname:
             continue
-        typ = parts[-2]
-        name = parts[-1]
-        is_array = typ.endswith('[]') or name.endswith('[]')
-        typ = re.sub(r"\[\]$", "", typ)
-        name = re.sub(r"\[\]$", "", name)
-        # Strip generic params
-        typ = re.sub(r"<.*>", "", typ)
-        # Strip package qualification
-        typ = typ.split('.')[-1]
-        res.append((typ, is_array, name))
+        name = mname.group(1)
+        name_has_arr = bool(mname.group(2))
+        type_part = s[:mname.start()].strip()
+        # remove modifiers like 'final'
+        type_part = re.sub(r"\bfinal\s+", "", type_part).strip()
+        type_has_arr = False
+        if type_part.endswith('[]'):
+            type_has_arr = True
+            type_part = type_part[:-2].strip()
+        is_array = type_has_arr or name_has_arr
+        # Strip generics and package qualification
+        base = _strip_generics_balanced(type_part).strip()
+        base = base.split('.')[-1] if base else 'Object'
+        res.append((base, is_array, name))
     return res
 
 
@@ -1238,9 +1283,10 @@ def transpile(code: str) -> str:
         "from typing import *",
         "from abc import ABC, abstractmethod",
         "import sys",
+        "import inspect",
         "__neoak_stdin = sys.stdin",
         "__neoak_stderr = sys.stderr",
-        "from neoak.rt import Object, Class, Scanner, File",
+        "from neoak.rt import Object, Class, Scanner, File, StdDraw, Color",
         "def _neoak_strcat(*parts):\n    return ''.join(str(p) for p in parts)\n",
         "def _neoak_plus(*parts):\n    acc = None\n    for p in parts:\n        if acc is None:\n            acc = p\n        else:\n            if isinstance(acc, str) or isinstance(p, str):\n                acc = str(acc) + str(p)\n            else:\n                acc = acc + p\n    return acc\n",
         "def _neoak_is_type(x, t, arr=False):\n"
@@ -1259,6 +1305,28 @@ def transpile(code: str) -> str:
         "        return isinstance(x, cls) if cls else True\n"
         "    except Exception:\n"
         "        return True\n",
+        # Access control helpers (instance-level)
+        "def _neoak_allow_private(owner):\n"
+        "    f = inspect.currentframe().f_back\n"
+        "    while f:\n"
+        "        loc = f.f_locals\n"
+        "        s = loc.get('self', None)\n"
+        "        if s is not None and s.__class__ is owner:\n"
+        "            return True\n"
+        "        f = f.f_back\n"
+        "    return False\n",
+        "def _neoak_allow_protected(owner):\n"
+        "    f = inspect.currentframe().f_back\n"
+        "    while f:\n"
+        "        loc = f.f_locals\n"
+        "        s = loc.get('self', None)\n"
+        "        try:\n"
+        "            if s is not None and isinstance(s, owner):\n"
+        "                return True\n"
+        "        except Exception:\n"
+        "            pass\n"
+        "        f = f.f_back\n"
+        "    return False\n",
     ]
 
     interfaces = _extract_interfaces(code)
@@ -1391,7 +1459,7 @@ def transpile(code: str) -> str:
                 if cls.base and 'super(' not in body:
                     py_lines.append("            super().__init__()")
                 ctor_param_names = [n for (_t, _arr, n) in details]
-                py_body = _translate_block(body, instance=True, field_names=field_set, param_names=ctor_param_names, class_name=cls.name, static_names={name for (_ret, name, _params, _body, *_extra) in cls.static_methods}, source_file=src_path, source_start_line=start_line, method_name=f"{cls.name}.{name}")
+                py_body = _translate_block(body, instance=True, field_names=field_set, param_names=ctor_param_names, class_name=cls.name, static_names={name for (_ret, name, _params, _body, *_extra) in cls.static_methods}, source_file=src_path, source_start_line=start_line, method_name=f"{cls.name}.__init__")
                 py_lines.append("".join(["            " + ln if ln else ln for ln in py_body.splitlines(True)]))
                 py_lines.append("            return")
             py_lines.append("        raise TypeError('No matching constructor for given arguments')")
@@ -1408,6 +1476,31 @@ def transpile(code: str) -> str:
                 py_lines.append("        super().__init__()")
             else:
                 py_lines.append("        pass")
+
+        # Define properties for private/protected instance fields
+        for (typ, name, _init) in cls.fields:
+            acc = cls.field_access.get(name, 'public')
+            if acc in ('private', 'protected'):
+                # Backing storage name
+                backing = f"__neo_field_{name}"
+                # Getter
+                py_lines.append(f"    @property")
+                py_lines.append(f"    def {name}(self):")
+                if acc == 'private':
+                    py_lines.append(f"        if not _neoak_allow_private({cls.name}):")
+                else:
+                    py_lines.append(f"        if not _neoak_allow_protected({cls.name}):")
+                py_lines.append(f"            raise PermissionError('IllegalAccessError: {acc} field {name}')")
+                py_lines.append(f"        return getattr(self, '{backing}', None)")
+                # Setter
+                py_lines.append(f"    @{name}.setter")
+                py_lines.append(f"    def {name}(self, value):")
+                if acc == 'private':
+                    py_lines.append(f"        if not _neoak_allow_private({cls.name}):")
+                else:
+                    py_lines.append(f"        if not _neoak_allow_protected({cls.name}):")
+                py_lines.append(f"            raise PermissionError('IllegalAccessError: {acc} field {name}')")
+                py_lines.append(f"        setattr(self, '{backing}', value)")
 
         # Emit abstract methods declared without bodies
         for (_ret, name, params, _src, _ln) in cls.abstract_methods:
@@ -1427,6 +1520,14 @@ def transpile(code: str) -> str:
                 params, body, _, src_path, start_line = overs[0]
                 params_py, _names = _translate_params(params)
                 py_lines.append(f"    def {name}(self, {params_py}):")
+                # Access enforcement for instance methods
+                access = cls.inst_method_access.get((name, params), 'public')
+                if access in ('private', 'protected'):
+                    if access == 'private':
+                        py_lines.append(f"        if not _neoak_allow_private({cls.name}):")
+                    else:
+                        py_lines.append(f"        if not _neoak_allow_protected({cls.name}):")
+                    py_lines.append(f"            raise PermissionError('IllegalAccessError: {access} method {name}')")
                 py_body = _translate_block(body, instance=True, field_names=field_set, param_names=_names, class_name=cls.name, static_names={name for (_ret, name, _params, _body, *_extra) in cls.static_methods}, source_file=src_path, source_start_line=start_line, method_name=f"{cls.name}.{name}")
                 py_lines.append("".join(["        " + ln if ln else ln for ln in py_body.splitlines(True)]))
             else:
@@ -1440,6 +1541,21 @@ def transpile(code: str) -> str:
                     py_lines.append("".join(["        " + ln if ln else ln for ln in py_body.splitlines(True)]))
                 # Dispatcher
                 py_lines.append(f"    def {name}(self, *args):")
+                # Determine most restrictive access across overloads
+                most = 'public'
+                for params, _body, _ret, _src, _ln in overs:
+                    acc = cls.inst_method_access.get((name, params), 'public')
+                    if acc == 'private':
+                        most = 'private'
+                        break
+                    if acc == 'protected' and most != 'private':
+                        most = 'protected'
+                if most in ('private', 'protected'):
+                    if most == 'private':
+                        py_lines.append(f"        if not _neoak_allow_private({cls.name}):")
+                    else:
+                        py_lines.append(f"        if not _neoak_allow_protected({cls.name}):")
+                    py_lines.append(f"            raise PermissionError('IllegalAccessError: {most} method {name}')")
                 for idx, (params, _body, _ret, _src, _ln) in enumerate(overs):
                     details = _parse_params_detailed(params)
                     arity = len(details)
@@ -1473,6 +1589,7 @@ def transpile(code: str) -> str:
                 params_py, _names = _translate_params(params)
                 py_lines.append("    @staticmethod")
                 py_lines.append(f"    def {name}({params_py}):")
+                # Note: static method access modifiers are not strictly enforced yet
                 py_body = _translate_block(body, class_name=cls.name, static_names={name for (_ret, name, _params, _body, *_extra) in cls.static_methods}, source_file=src_path, source_start_line=start_line, method_name=f"{cls.name}.{name}")
                 py_lines.append("".join(["        " + ln if ln else ln for ln in py_body.splitlines(True)]))
                 if name == 'main':
@@ -1490,6 +1607,7 @@ def transpile(code: str) -> str:
                 # Dispatcher
                 py_lines.append("    @staticmethod")
                 py_lines.append(f"    def {name}(*args):")
+                # Note: static method access modifiers are not strictly enforced yet
                 for idx, (params, _body, _ret, _src, _ln) in enumerate(overs):
                     details = _parse_params_detailed(params)
                     arity = len(details)
@@ -1543,36 +1661,111 @@ def transpile(code: str) -> str:
 def _split_top_level_commas(s: str) -> list[str]:
     parts = []
     buf = []
-    depth = 0
+    depth_paren = 0
+    depth_brack = 0
+    depth_brace = 0
+    depth_angle = 0
     in_str = False
     str_ch = ''
-    for i, ch in enumerate(s):
+    prev = ''
+    for ch in s:
         if in_str:
             buf.append(ch)
-            if ch == str_ch and s[i - 1] != '\\':
+            if ch == str_ch and prev != '\\':
                 in_str = False
+            prev = ch
             continue
         if ch in ('"', "'"):
             in_str = True
             str_ch = ch
             buf.append(ch)
+            prev = ch
             continue
-        if ch == '(' or ch == '[' or ch == '{':
-            depth += 1
+        if ch == '(':
+            depth_paren += 1
             buf.append(ch)
+            prev = ch
             continue
-        if ch == ')' or ch == ']' or ch == '}':
-            depth = max(0, depth - 1)
+        if ch == ')':
+            depth_paren = max(0, depth_paren - 1)
             buf.append(ch)
+            prev = ch
             continue
-        if ch == ',' and depth == 0:
+        if ch == '[':
+            depth_brack += 1
+            buf.append(ch)
+            prev = ch
+            continue
+        if ch == ']':
+            depth_brack = max(0, depth_brack - 1)
+            buf.append(ch)
+            prev = ch
+            continue
+        if ch == '{':
+            depth_brace += 1
+            buf.append(ch)
+            prev = ch
+            continue
+        if ch == '}':
+            depth_brace = max(0, depth_brace - 1)
+            buf.append(ch)
+            prev = ch
+            continue
+        if ch == '<':
+            depth_angle += 1
+            buf.append(ch)
+            prev = ch
+            continue
+        if ch == '>':
+            if depth_angle > 0:
+                depth_angle -= 1
+            buf.append(ch)
+            prev = ch
+            continue
+        if ch == ',' and depth_paren == 0 and depth_brack == 0 and depth_brace == 0 and depth_angle == 0:
             parts.append(''.join(buf))
             buf = []
+            prev = ch
             continue
         buf.append(ch)
+        prev = ch
     if buf:
         parts.append(''.join(buf))
     return parts
+
+def _strip_generics_balanced(t: str) -> str:
+    # Remove generic parameter lists like <T, U<V>> while preserving base name and qualification
+    out = []
+    depth = 0
+    in_str = False
+    str_ch = ''
+    prev = ''
+    for ch in t:
+        if in_str:
+            out.append(ch)
+            if ch == str_ch and prev != '\\':
+                in_str = False
+            prev = ch
+            continue
+        if ch in ('"', "'"):
+            in_str = True
+            str_ch = ch
+            out.append(ch)
+            prev = ch
+            continue
+        if ch == '<':
+            depth += 1
+            prev = ch
+            continue
+        if ch == '>':
+            if depth > 0:
+                depth -= 1
+            prev = ch
+            continue
+        if depth == 0:
+            out.append(ch)
+        prev = ch
+    return ''.join(out)
 
 
 def _maybe_rewrite_string_concat(expr: str) -> str:

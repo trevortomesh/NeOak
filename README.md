@@ -50,6 +50,25 @@ Overloading:
 - Static methods: overloaded static methods dispatch similarly and remain callable as unqualified top-level functions.
 - Dispatch favors the first matching overload in declaration order.
 
+## Generics
+
+NeOak parses Java-style generics and erases them at runtime. This means generic type arguments influence parsing and code generation (e.g., splitting and class/interface headers), but they do not affect runtime type checks.
+
+- Supported parsing:
+  - Declarations: `List<String> names;`, `Map<String, Integer> counts;`, `Foo<Bar<Baz>> nested;`
+  - Constructors: `List<String> xs = new ArrayList<String>();`
+  - For-each: `for (String s : new String[] {"a", "b"}) { ... }`
+  - Method params: `void m(Map<String, Integer> m, List<List<String>> xs)`
+  - Class/interface headers: `class Box<T> { ... }`, `interface I<T> extends J<List<T>> {}`,
+    `class C<T> extends Base<List<T>> implements A<C<T>>, B<C<T>> { ... }`
+
+- Dotted/qualified types are accepted: `java.util.List<String>`; the short class name is what matters at runtime.
+
+- Erasure semantics and limitations:
+  - Type arguments are removed in the generated Python; runtime dispatch only uses base types and array-ness.
+  - No wildcard/bounds validation (`?`, `extends`, `super`) and no enforcement of element types at runtime.
+  - Overload resolution does not distinguish between different parameterizations of the same generic type.
+
 Projects and files:
 - Entry file can be `Main.nk`, `Main.nk.java`, or `Main.java`.
 - Place additional classes in separate files; runner loads all `.nk`, `.nk.java`, `.java` files recursively under the given directory.
@@ -60,10 +79,11 @@ Projects and files:
 1. Put a `Main.nk`, `Main.nk.java`, or `Main.java` somewhere under your project directory. You can place additional classes in separate files in the same directory or subdirectories (e.g., `src/app/Person.java`, `src/app/Student.java`). The runner auto-loads all `.nk`, `.nk.java`, and `.java` files recursively under the entry directory.
 2. Run the NeOak runner:
 
-- Installed CLI: `neoak` (searches current directory recursively)
-- Point at a directory (recursive): `neoak path/to/src`
-- Emit generated Python: `neoak --emit`
-- Local dev without install: `python3 neoak.py` or `python3 neoak.py path/to/src`
+- Default run (current directory): `neoak run`
+- Run a specific path: `neoak run path/to/src`
+- Emit generated Python: `neoak run --emit`
+- Generate docs (JavaDoc‑style): `neoak docs path/to/src --out docs`
+- Local dev without install: `python3 neoak.py run` or `python3 neoak.py run path/to/src`
 
 ## Installation
 
@@ -86,7 +106,13 @@ Uninstall:
 
 Optional: emit the transpiled Python instead of running:
 ```
-neoak --emit
+neoak run --emit
+```
+
+Generate docs (JavaDoc-style):
+```
+neoak docs path/to/src --out docs
+open docs/index.html
 ```
 
 ## Project Layout
@@ -155,8 +181,114 @@ Known limitations:
 - Overload resolution is best-effort at runtime (arity + coarse types); Java numeric promotions and boxing aren’t modeled.
 - `package` is ignored; no real namespacing yet (class name collisions across packages aren’t isolated).
 - No interfaces, abstract classes, enums, annotations, lambdas/streams.
-- Generics are ignored/erased; arrays are Python lists.
+- Generics: parsed and erased at runtime (no type-arg enforcement); arrays are Python lists.
 - Not compatible with `.class`/`.jar` artifacts.
+
+## Graphics (StdDraw)
+
+NeOak includes a tiny, Tkinter-backed drawing helper inspired by StdDraw.
+
+- Static API on `StdDraw`:
+  - `StdDraw.open(width, height, title)`
+  - `StdDraw.clear([color])`, `StdDraw.setPenColor(name|r,g,b)`
+  - `StdDraw.line(x0, y0, x1, y1)`
+  - `StdDraw.circle(x, y, r)`, `StdDraw.filledCircle(x, y, r)`
+  - `StdDraw.rectangle(x, y, w, h)`, `StdDraw.filledRectangle(x, y, w, h)`
+  - `StdDraw.text(x, y, str)`
+  - `StdDraw.show()`, `StdDraw.pause(ms)`, `StdDraw.close()`
+
+Example:
+
+```
+class Main {
+    public static void main(String[] args) {
+        StdDraw.open(400, 300, "NeOak Graphics");
+        StdDraw.clear("white");
+        StdDraw.setPenColor(255, 0, 0);
+        StdDraw.line(10, 10, 390, 10);
+        StdDraw.setPenColor("blue");
+        StdDraw.circle(200, 150, 60);
+        StdDraw.setPenColor("green");
+        StdDraw.filledRectangle(150, 200, 100, 40);
+        StdDraw.setPenColor("black");
+        StdDraw.text(200, 150, "Hello");
+        StdDraw.show();
+        StdDraw.pause(500);
+        StdDraw.close();
+    }
+}
+```
+
+Notes:
+- Requires Python Tkinter (usually included). If unavailable, graphics calls raise a runtime error.
+- Coordinates are pixel-based from top-left.
+
+## Reference (Early Draft)
+
+This section summarizes the current language and runtime surface area in a quick, JavaDocs‑style outline. It will evolve into a generated reference.
+
+Language
+- Classes: `class Name [extends Base] [implements I1, I2] { ... }`
+- Methods: `public|protected|private [static] T name(params) { ... }`
+- Constructors: `public|protected|private Name(params) { ... }`
+- Overloading: methods/constructors dispatched by arity + coarse types
+- Control flow: `if/else if/else`, `while`, classic `for`, `for-each`, `switch`, `try/catch/finally`
+- Operators: `&&`, `||`, `!`, `++/--` (statements), `+` with Java concat semantics
+- Exceptions: `throw`, multi‑catch; checked exceptions not enforced
+- Generics: parsed and erased at runtime (no wildcard/bounds enforcement)
+- Modifiers: `public/protected/private` enforced for instance methods/fields (see Notes); static enforcement pending
+
+Runtime API
+- `Object`
+  - `getClass(): Class`, `hashCode(): int`, `equals(Object): boolean`, `toString(): String`
+  - Concurrency helpers: `wait(timeout)`, `notify()`, `notifyAll()` (best‑effort)
+- `Class`
+  - `getName(): String`
+- `Scanner`
+  - `Scanner(String|Reader)`, `useDelimiter(String)`, `hasNext()`, `next()`, `nextLine()`, `nextInt()`, `nextDouble()`, `nextLong()`, `nextBoolean()`, `close()`
+- `File`
+  - `exists()`, `isDirectory()`, `isFile()`, `length()`, `lastModified()`, `getName()`, `getPath()`, `getAbsolutePath()`, `mkdir()`, `mkdirs()`, `list()`, `delete()`
+- `StdDraw` (graphics)
+  - `open(w,h,title)`, `clear([color])`, `setPenColor(name|r,g,b)`, `line(x0,y0,x1,y1)`, `circle(x,y,r)`, `filledCircle(x,y,r)`, `rectangle(x,y,w,h)`, `filledRectangle(x,y,w,h)`, `text(x,y,s)`, `show()`, `pause(ms)`, `close()`
+- Helpers (generated into output)
+  - `_neoak_plus(...)` for Java‑like `+` semantics, `_neoak_is_type(x,t,arr=False)` for overload checks
+
+Notes
+- Access control: instance `private/protected` is enforced via runtime checks; static members are not yet enforced. Package visibility is not modeled.
+- Arrays: Python lists; no runtime enforcement of generic element type.
+- Packages/imports: parsed but not enforced as namespaces yet.
+
+## Documentation Style (JavaDoc‑like)
+
+We plan to support JavaDoc‑style block comments and tags in NeOak sources and generate a reference site. Draft conventions:
+
+- Use `/** ... */` above classes and methods.
+- Supported tags (planned): `@param`, `@return`, `@throws`, `@since`, `@deprecated`, `@see`.
+
+Example:
+
+```
+/**
+ * A fast input scanner.
+ * @since 0.1
+ */
+class Scanner {
+    /**
+     * Reads next token delimited by the current pattern.
+     * @return next token as String
+     * @throws NoSuchElementException if input is exhausted
+     */
+    public String next() { ... }
+}
+```
+
+Generation Plan
+- Add a `neoak docs` subcommand that:
+  - Parses sources, extracts JavaDoc blocks, signatures, and tags
+  - Emits Markdown/HTML into `docs/` with a simple template (search + per‑symbol pages)
+  - Optionally links to source lines using existing `NEOAK_FILE` markers
+
+If you’d like, I can scaffold `neoak docs` with a minimal parser and a basic Markdown theme as a first step.
 
 ## Why NeOak?
 
@@ -171,7 +303,7 @@ Known limitations:
 - Packages: Real package namespaces (map `package` to modules; avoid collisions).
 - Types: Better overload resolution and numeric promotions; boxing semantics.
 - OOP: Interfaces, abstract classes, enums, visibility hints.
-- Generics: Partial support (erasure-aware checks; array/generic bridges).
+ - Generics: Parsing + erasure in place; consider erasure-aware checks and array/generic bridges.
 - Stdlib: Common helpers (time, parsing, I/O) with Java-like facades.
 - Imports: Classpath-style discovery, selective file inclusion, wildcards.
 - Tooling: Improve errors, source maps in traces, `--check` static validation.

@@ -52,10 +52,7 @@ def _gather_sources(entry: Path) -> str:
     for p in files:
         rel = str(p.relative_to(base_dir))
         parts.append(f"/* NEOAK_FILE: {rel} */\n" + p.read_text(encoding="utf-8"))
-    # Ensure main file content present (should be by above, but keep safety)
-    main_src = main_file.read_text(encoding="utf-8")
-    if not any(s == main_src for s in parts):
-        parts.insert(0, main_src)
+    # No need to re-insert main; it is already part of files
     return "\n\n".join(parts)
 
 

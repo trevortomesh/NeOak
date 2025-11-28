@@ -4,6 +4,10 @@ import sys
 import re
 import os
 import time
+try:
+    import tkinter as _tk
+except Exception:  # GUI may be unavailable; guard imports
+    _tk = None
 
 
 class Class:
@@ -244,3 +248,147 @@ class File(Object):
     # String form
     def toString(self) -> str:
         return self.getPath()
+
+
+# ------------------------------------------------------------
+# Simple graphics: StdDraw-style wrapper using tkinter
+# ------------------------------------------------------------
+
+class _GraphicsCtx:
+    def __init__(self):
+        self.root = None
+        self.canvas = None
+        self.width = 0
+        self.height = 0
+        self.pen = "black"
+        self.bg = "white"
+
+    def ensure(self, width: int | None = None, height: int | None = None, title: str | None = None):
+        if _tk is None:
+            raise RuntimeError("Graphics unavailable: tkinter not installed")
+        if self.root is None:
+            self.root = _tk.Tk()
+            self.root.protocol("WM_DELETE_WINDOW", self.root.destroy)
+        if width and height:
+            self.width, self.height = int(width), int(height)
+        if self.canvas is None or (width and height):
+            if self.canvas is not None:
+                self.canvas.destroy()
+            self.canvas = _tk.Canvas(self.root, width=self.width, height=self.height, bg=self.bg, highlightthickness=0)
+            self.canvas.pack()
+        if title:
+            try:
+                self.root.title(title)
+            except Exception:
+                pass
+        self.root.update_idletasks()
+        self.root.update()
+
+_gfx = _GraphicsCtx()
+
+
+def _parse_color(*args):
+    if not args:
+        return "black"
+    if len(args) == 1:
+        c = args[0]
+        if isinstance(c, tuple) or isinstance(c, list):
+            r, g, b = c
+            return f"#{int(r)&255:02x}{int(g)&255:02x}{int(b)&255:02x}"
+        if isinstance(c, str):
+            return c
+        # Single int packed? Not supported; default
+        return "black"
+    if len(args) >= 3:
+        r, g, b = args[:3]
+        return f"#{int(r)&255:02x}{int(g)&255:02x}{int(b)&255:02x}"
+    return "black"
+
+
+class Color:
+    BLACK = "black"
+    WHITE = "white"
+    RED = "red"
+    GREEN = "green"
+    BLUE = "blue"
+    YELLOW = "yellow"
+    CYAN = "cyan"
+    MAGENTA = "magenta"
+    GRAY = "gray"
+
+
+class StdDraw(Object):
+    @staticmethod
+    def open(width: int, height: int, title: str | None = None):
+        _gfx.ensure(width, height, title)
+
+    @staticmethod
+    def clear(*color):
+        _gfx.ensure()
+        _gfx.bg = _parse_color(*color) if color else _gfx.bg
+        _gfx.canvas.configure(bg=_gfx.bg)
+        _gfx.canvas.delete("all")
+        _gfx.root.update_idletasks()
+        _gfx.root.update()
+
+    @staticmethod
+    def setPenColor(*color):
+        _gfx.ensure()
+        _gfx.pen = _parse_color(*color)
+
+    @staticmethod
+    def line(x0: float, y0: float, x1: float, y1: float):
+        _gfx.ensure()
+        _gfx.canvas.create_line(float(x0), float(y0), float(x1), float(y1), fill=_gfx.pen)
+
+    @staticmethod
+    def circle(x: float, y: float, r: float):
+        _gfx.ensure()
+        x, y, r = float(x), float(y), float(r)
+        _gfx.canvas.create_oval(x - r, y - r, x + r, y + r, outline=_gfx.pen)
+
+    @staticmethod
+    def filledCircle(x: float, y: float, r: float):
+        _gfx.ensure()
+        x, y, r = float(x), float(y), float(r)
+        _gfx.canvas.create_oval(x - r, y - r, x + r, y + r, outline=_gfx.pen, fill=_gfx.pen)
+
+    @staticmethod
+    def rectangle(x: float, y: float, w: float, h: float):
+        _gfx.ensure()
+        x, y, w, h = float(x), float(y), float(w), float(h)
+        _gfx.canvas.create_rectangle(x, y, x + w, y + h, outline=_gfx.pen)
+
+    @staticmethod
+    def filledRectangle(x: float, y: float, w: float, h: float):
+        _gfx.ensure()
+        x, y, w, h = float(x), float(y), float(w), float(h)
+        _gfx.canvas.create_rectangle(x, y, x + w, y + h, outline=_gfx.pen, fill=_gfx.pen)
+
+    @staticmethod
+    def text(x: float, y: float, s: str):
+        _gfx.ensure()
+        _gfx.canvas.create_text(float(x), float(y), text=str(s), fill=_gfx.pen, anchor="center")
+
+    @staticmethod
+    def show():
+        _gfx.ensure()
+        _gfx.root.update_idletasks()
+        _gfx.root.update()
+
+    @staticmethod
+    def pause(ms: int = 0):
+        _gfx.ensure()
+        if ms and ms > 0:
+            _gfx.root.after(int(ms))
+        _gfx.root.update_idletasks()
+        _gfx.root.update()
+
+    @staticmethod
+    def close():
+        if _gfx.root is not None:
+            try:
+                _gfx.root.destroy()
+            finally:
+                _gfx.root = None
+                _gfx.canvas = None

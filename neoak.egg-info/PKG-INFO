@@ -62,6 +62,25 @@ Overloading:
 - Static methods: overloaded static methods dispatch similarly and remain callable as unqualified top-level functions.
 - Dispatch favors the first matching overload in declaration order.
 
+## Generics
+
+NeOak parses Java-style generics and erases them at runtime. This means generic type arguments influence parsing and code generation (e.g., splitting and class/interface headers), but they do not affect runtime type checks.
+
+- Supported parsing:
+  - Declarations: `List<String> names;`, `Map<String, Integer> counts;`, `Foo<Bar<Baz>> nested;`
+  - Constructors: `List<String> xs = new ArrayList<String>();`
+  - For-each: `for (String s : new String[] {"a", "b"}) { ... }`
+  - Method params: `void m(Map<String, Integer> m, List<List<String>> xs)`
+  - Class/interface headers: `class Box<T> { ... }`, `interface I<T> extends J<List<T>> {}`,
+    `class C<T> extends Base<List<T>> implements A<C<T>>, B<C<T>> { ... }`
+
+- Dotted/qualified types are accepted: `java.util.List<String>`; the short class name is what matters at runtime.
+
+- Erasure semantics and limitations:
+  - Type arguments are removed in the generated Python; runtime dispatch only uses base types and array-ness.
+  - No wildcard/bounds validation (`?`, `extends`, `super`) and no enforcement of element types at runtime.
+  - Overload resolution does not distinguish between different parameterizations of the same generic type.
+
 Projects and files:
 - Entry file can be `Main.nk`, `Main.nk.java`, or `Main.java`.
 - Place additional classes in separate files; runner loads all `.nk`, `.nk.java`, `.java` files recursively under the given directory.
@@ -167,8 +186,47 @@ Known limitations:
 - Overload resolution is best-effort at runtime (arity + coarse types); Java numeric promotions and boxing aren’t modeled.
 - `package` is ignored; no real namespacing yet (class name collisions across packages aren’t isolated).
 - No interfaces, abstract classes, enums, annotations, lambdas/streams.
-- Generics are ignored/erased; arrays are Python lists.
+- Generics: parsed and erased at runtime (no type-arg enforcement); arrays are Python lists.
 - Not compatible with `.class`/`.jar` artifacts.
+
+## Graphics (StdDraw)
+
+NeOak includes a tiny, Tkinter-backed drawing helper inspired by StdDraw.
+
+- Static API on `StdDraw`:
+  - `StdDraw.open(width, height, title)`
+  - `StdDraw.clear([color])`, `StdDraw.setPenColor(name|r,g,b)`
+  - `StdDraw.line(x0, y0, x1, y1)`
+  - `StdDraw.circle(x, y, r)`, `StdDraw.filledCircle(x, y, r)`
+  - `StdDraw.rectangle(x, y, w, h)`, `StdDraw.filledRectangle(x, y, w, h)`
+  - `StdDraw.text(x, y, str)`
+  - `StdDraw.show()`, `StdDraw.pause(ms)`, `StdDraw.close()`
+
+Example:
+
+```
+class Main {
+    public static void main(String[] args) {
+        StdDraw.open(400, 300, "NeOak Graphics");
+        StdDraw.clear("white");
+        StdDraw.setPenColor(255, 0, 0);
+        StdDraw.line(10, 10, 390, 10);
+        StdDraw.setPenColor("blue");
+        StdDraw.circle(200, 150, 60);
+        StdDraw.setPenColor("green");
+        StdDraw.filledRectangle(150, 200, 100, 40);
+        StdDraw.setPenColor("black");
+        StdDraw.text(200, 150, "Hello");
+        StdDraw.show();
+        StdDraw.pause(500);
+        StdDraw.close();
+    }
+}
+```
+
+Notes:
+- Requires Python Tkinter (usually included). If unavailable, graphics calls raise a runtime error.
+- Coordinates are pixel-based from top-left.
 
 ## Why NeOak?
 
@@ -183,7 +241,7 @@ Known limitations:
 - Packages: Real package namespaces (map `package` to modules; avoid collisions).
 - Types: Better overload resolution and numeric promotions; boxing semantics.
 - OOP: Interfaces, abstract classes, enums, visibility hints.
-- Generics: Partial support (erasure-aware checks; array/generic bridges).
+ - Generics: Parsing + erasure in place; consider erasure-aware checks and array/generic bridges.
 - Stdlib: Common helpers (time, parsing, I/O) with Java-like facades.
 - Imports: Classpath-style discovery, selective file inclusion, wildcards.
 - Tooling: Improve errors, source maps in traces, `--check` static validation.
@@ -233,7 +291,18 @@ NeOak behaves like “Java without the JVM”. You write Java‑like sources; th
 
 **Stdlib Stubs (for IDEs):**
 - Under `neoak/stdlib/java/...` you’ll find `java/lang/Object.java`, `java/lang/System.java`, `java/io/File.java`, `java/util/Scanner.java`.
-- These are editor‑facing stubs; the transpiler lowers usage to the runtime shim at execution.
+- These are editor‑facing stubs only. They are NOT compiled or injected into transpilation; the runner transpiles just your project files. At runtime the transpiler lowers usage to the Python shim (`neoak.rt`).
 
 **Design Choices:**
 - A minimal shim + Java‑facing stubs maximize familiarity while keeping behavior robust. Enforcement is Java‑style (semicolons, abstract/interface rules) with clear `file:line` diagnostics and Java‑like stack traces.
+
+## Experiment Notes
+
+NeOak is intentionally an experiment in “Java without the JVM”. Key guiding ideas:
+
+- Keep the surface area Java‑like: classes, interfaces/abstracts, `System.*`, familiar project layout, and IDE stubs.
+- Map semantics predictably to Python: `_neoak_plus` for `+`, field auto‑qualification, ABC for abstract/interface contracts, and practical `Scanner`/`File`.
+- Be strict where it helps: require semicolons, validate abstract/interface rules, and print Java‑style errors/tracebacks with original file:line.
+- Stay small and hackable: a thin shim and straightforward rewrites mean you can read the generated Python and understand what happened.
+
+This is not a JVM replacement. It won’t run `.class`/`.jar` artifacts, and some features are best‑effort approximations. But it’s a fun, pragmatic way to write Java‑ish code and run it instantly with Python.
