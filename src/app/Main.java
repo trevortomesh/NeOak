@@ -1,7 +1,19 @@
 package app;
+
+import java.nio.file.Files;
+import java.nio.file.Paths;
+import java.util.Scanner;
+import java.util.NoSuchElementException;
+
 // Sample NeOak program
 class Main {
     public static void main(String[] args) {
+
+        int[] test = {1,2,3};
+        System.out.println(test[1]);
+        String content = Files.readString(Paths.get("input.txt"));
+        System.out.println(content);
+
         System.out.println("Hello from NeOak!");
 
         int n = 3;
@@ -39,6 +51,19 @@ class Main {
         System.out.println(s.describe());
         System.out.println(p.describe("Person"));
         System.out.println(Main.greet("Yo", 3));
+
+        // Read input.txt with Scanner (line by line)
+        Scanner sc = new Scanner("input.txt");
+        try {
+            while (true) {
+                String line = sc.nextLine();
+                System.out.println(line);
+            }
+        } catch (NoSuchElementException e) {
+            // EOF reached
+        } finally {
+            sc.close();
+        }
     }
 
     public static String greet(String name) {

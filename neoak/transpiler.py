@@ -656,8 +656,13 @@ def _translate_block(body: str, instance: bool = False, field_names: set[str] | 
             i += 1
             continue
 
-        # Expand inline blocks with both { and } on the same line
-        if '{' in line and '}' in line and line.index('{') < line.rindex('}'):
+        # Expand inline blocks with both { and } on the same line, except for
+        # initializer expressions like "x = { ... };" which should be handled
+        # by array/object initializer logic below.
+        if (
+            '{' in line and '}' in line and line.index('{') < line.rindex('}')
+            and not re.search(r"=\s*\{.*\}\s*;\s*$", line)
+        ):
             before = line[: line.index('{') + 1].strip()
             inner = line[line.index('{') + 1 : line.rindex('}')].strip()
             after = line[line.rindex('}') + 1 :].strip()
@@ -985,6 +990,25 @@ def _translate_block(body: str, instance: bool = False, field_names: set[str] | 
             i += 1
             continue
 
+        # Array variable declaration with inline initializer, e.g.:
+        #   int[] a = {1,2,3};  or  int a[] = {1,2,3};  or  String[] s = {"a", "b"};
+        # Accept trailing whitespace after semicolon too.
+        m_arr_init = re.match(r"^(?:final\s+)?([A-Za-z_][A-Za-z0-9_\.]*(?:\s*<[^>]+>)?)\s*(\[\])?\s+(\w+)\s*(\[\])?\s*=\s*\{(.*)\}\s*;\s*$", line)
+        if m_arr_init:
+            arr_type = m_arr_init.group(1).strip()
+            name = m_arr_init.group(3)
+            elems_src = m_arr_init.group(5)
+            # Split top-level commas and rewrite each element
+            parts = [p.strip() for p in _split_top_level_commas(elems_src)]
+            parts = [
+                _replace_literals_and_ops(p) for p in parts if p != ''
+            ]
+            emit(f"{name} = [" + ", ".join(parts) + "]")
+            # Track as local to avoid field auto-qualification later in the block
+            locals_set.add(name)
+            i += 1
+            continue
+
         # Regular statement(s); may contain multiple semicolon-separated parts
         # Enforce that non-empty, non-control lines contain at least one top-level semicolon
         if line.strip() and not _has_top_level_semicolon(line):
@@ -1301,7 +1325,7 @@ def _extract_classes(code: str) -> List[ClassSpec]:
                 name = mstatic.group(5)
                 init = mstatic.group(6).strip() if mstatic.group(6) else None
                 spec.static_fields.append((typ, name, init, acc))
-            else:
+            elif not mfield:
                 # Heuristic: detect missing semicolon for a top-level field declaration
                 first_line = d.splitlines()[0].strip()
                 if '(' in first_line:
@@ -1420,7 +1444,7 @@ def transpile(code: str) -> str:
         "import inspect",
         "__neoak_stdin = sys.stdin",
         "__neoak_stderr = sys.stderr",
-        "from neoak.rt import Object, Class, Scanner, File, StdDraw, Color",
+        "from neoak.rt import Object, Class, Scanner, File, StdDraw, Color, Path, Paths, Files",
         "import threading\n",
         "__neoak_tls = threading.local()\n",
         "def _neoak_pkg_push(pkg):\n"
@@ -1756,13 +1780,13 @@ def transpile(code: str) -> str:
                 access = cls.inst_method_access.get((name, params), 'public')
                 if access in ('private', 'protected'):
                     if access == 'private':
-                        py_lines.append(f"        if not _neoak_allow_private({cls.name}):")
+                        py_lines.append(f"            if not _neoak_allow_private({cls.name}):")
                     else:
-                        py_lines.append(f"        if not _neoak_allow_protected({cls.name}):")
-                    py_lines.append(f"            raise PermissionError('IllegalAccessError: {access} method {name}')")
+                        py_lines.append(f"            if not _neoak_allow_protected({cls.name}):")
+                    py_lines.append(f"                raise PermissionError('IllegalAccessError: {access} method {name}')")
                 elif access == 'package':
-                    py_lines.append(f"        if not _neoak_allow_package('{pkg_literal}'):")
-                    py_lines.append(f"            raise PermissionError('IllegalAccessError: package-private method {name}')")
+                    py_lines.append(f"            if not _neoak_allow_package('{pkg_literal}'):")
+                    py_lines.append(f"                raise PermissionError('IllegalAccessError: package-private method {name}')")
                 py_body = _translate_block(body, instance=True, field_names=field_set, param_names=_names, class_name=cls.name, static_names={name for (_ret, name, _params, _body, *_extra) in cls.static_methods}, source_file=src_path, source_start_line=start_line, method_name=f"{cls.name}.{name}")
                 py_lines.append("".join(["            " + ln if ln else ln for ln in py_body.splitlines(True)]))
                 py_lines.append("        finally:")
@@ -1799,13 +1823,13 @@ def transpile(code: str) -> str:
                         most = 'package'
                 if most in ('private', 'protected'):
                     if most == 'private':
-                        py_lines.append(f"        if not _neoak_allow_private({cls.name}):")
+                        py_lines.append(f"            if not _neoak_allow_private({cls.name}):")
                     else:
-                        py_lines.append(f"        if not _neoak_allow_protected({cls.name}):")
-                    py_lines.append(f"            raise PermissionError('IllegalAccessError: {most} method {name}')")
+                        py_lines.append(f"            if not _neoak_allow_protected({cls.name}):")
+                    py_lines.append(f"                raise PermissionError('IllegalAccessError: {most} method {name}')")
                 elif most == 'package':
-                    py_lines.append(f"        if not _neoak_allow_package('{pkg_literal}'):")
-                    py_lines.append(f"            raise PermissionError('IllegalAccessError: package-private method {name}')")
+                    py_lines.append(f"            if not _neoak_allow_package('{pkg_literal}'):")
+                    py_lines.append(f"                raise PermissionError('IllegalAccessError: package-private method {name}')")
                 for idx, (params, _body, _ret, _src, _ln) in enumerate(overs):
                     details = _parse_params_detailed(params)
                     arity = len(details)
@@ -1815,10 +1839,10 @@ def transpile(code: str) -> str:
                         type_checks.append(f"_neoak_is_type(args[{aidx}], '{t}', {str(is_arr)})")
                     if type_checks:
                         cond.append(" and ".join(type_checks))
-                    py_lines.append(f"        if {' and '.join(cond)}:")
+                    py_lines.append(f"            if {' and '.join(cond)}:")
                     call_args = ", ".join([f"args[{i}]" for i in range(arity)])
-                    py_lines.append(f"            return self.{name}__ov{idx}({call_args})")
-                py_lines.append("        raise TypeError('No matching overload for method')")
+                    py_lines.append(f"                return self.{name}__ov{idx}({call_args})")
+                py_lines.append("            raise TypeError('No matching overload for method')")
                 py_lines.append("        finally:")
                 py_lines.append("            _neoak_pkg_pop()")
 
@@ -1847,8 +1871,8 @@ def transpile(code: str) -> str:
                 # Access enforcement for static methods (package/private/protected not fully modeled; support package here)
                 access = cls.static_method_access.get((name, params), 'public')
                 if access == 'package':
-                    py_lines.append(f"        if not _neoak_allow_package('{pkg_literal}'):")
-                    py_lines.append(f"            raise PermissionError('IllegalAccessError: package-private method {name}')")
+                    py_lines.append(f"            if not _neoak_allow_package('{pkg_literal}'):")
+                    py_lines.append(f"                raise PermissionError('IllegalAccessError: package-private method {name}')")
                 py_body = _translate_block(body, class_name=cls.name, static_names={name for (_ret, name, _params, _body, *_extra) in cls.static_methods}, source_file=src_path, source_start_line=start_line, method_name=f"{cls.name}.{name}")
                 py_lines.append("".join(["            " + ln if ln else ln for ln in py_body.splitlines(True)]))
                 py_lines.append("        finally:")
@@ -1883,8 +1907,8 @@ def transpile(code: str) -> str:
                     if acc == 'package' and most == 'public':
                         most = 'package'
                 if most == 'package':
-                    py_lines.append(f"        if not _neoak_allow_package('{pkg_literal}'):")
-                    py_lines.append(f"            raise PermissionError('IllegalAccessError: package-private method {name}')")
+                    py_lines.append(f"            if not _neoak_allow_package('{pkg_literal}'):")
+                    py_lines.append(f"                raise PermissionError('IllegalAccessError: package-private method {name}')")
                 for idx, (params, _body, _ret, _src, _ln) in enumerate(overs):
                     details = _parse_params_detailed(params)
                     arity = len(details)
@@ -1894,10 +1918,10 @@ def transpile(code: str) -> str:
                         type_checks.append(f"_neoak_is_type(args[{aidx}], '{t}', {str(is_arr)})")
                     if type_checks:
                         cond.append(" and ".join(type_checks))
-                    py_lines.append(f"        if {' and '.join(cond)}:")
+                    py_lines.append(f"            if {' and '.join(cond)}:")
                     call_args = ", ".join([f"args[{i}]" for i in range(arity)])
-                    py_lines.append(f"            return {cls.name}.{name}__ov{idx}({call_args})")
-                py_lines.append("        raise TypeError('No matching overload for static method')")
+                    py_lines.append(f"                return {cls.name}.{name}__ov{idx}({call_args})")
+                py_lines.append("            raise TypeError('No matching overload for static method')")
                 py_lines.append("        finally:")
                 py_lines.append("            _neoak_pkg_pop()")
                 if name == 'main':
@@ -2211,6 +2235,9 @@ def _split_top_level_semicolons(s: str) -> list[str]:
 
 
 def _has_top_level_semicolon(s: str) -> bool:
+    # Fast path: if line visibly ends with a semicolon, accept.
+    if s.strip().endswith(';'):
+        return True
     depth = 0
     in_str = False
     str_ch = ''

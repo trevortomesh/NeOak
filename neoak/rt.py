@@ -251,6 +251,64 @@ class File(Object):
 
 
 # ------------------------------------------------------------
+# java.nio.file shim: Path, Paths, Files
+# ------------------------------------------------------------
+
+class Path(Object):
+    def __init__(self, path: str):
+        super().__init__()
+        self._path = os.fspath(path)
+
+    def toString(self) -> str:
+        return self._path
+
+    # Helpers to roughly mirror some Path behavior
+    def getFileName(self) -> str:
+        return os.path.basename(self._path)
+
+    def toAbsolutePath(self) -> "Path":
+        return Path(os.path.abspath(self._path))
+
+
+class Paths(Object):
+    @staticmethod
+    def get(first: str, *more: str) -> Path:
+        # Join like Java's Paths.get(first, more...)
+        parts = (first,) + tuple(more)
+        return Path(os.path.join(*map(os.fspath, parts)))
+
+
+class Files(Object):
+    @staticmethod
+    def exists(p: Path) -> bool:
+        return os.path.exists(p._path)
+
+    @staticmethod
+    def isDirectory(p: Path) -> bool:
+        return os.path.isdir(p._path)
+
+    @staticmethod
+    def isRegularFile(p: Path) -> bool:
+        return os.path.isfile(p._path)
+
+    @staticmethod
+    def readString(p: Path) -> str:
+        with open(p._path, 'r', encoding='utf-8') as f:
+            return f.read()
+
+    @staticmethod
+    def writeString(p: Path, s: str) -> Path:
+        # Overwrites by default to mirror common usage
+        os.makedirs(os.path.dirname(p._path) or '.', exist_ok=True)
+        with open(p._path, 'w', encoding='utf-8') as f:
+            f.write(str(s))
+        return p
+
+    @staticmethod
+    def createDirectories(p: Path) -> None:
+        os.makedirs(p._path, exist_ok=True)
+
+# ------------------------------------------------------------
 # Simple graphics: StdDraw-style wrapper using tkinter
 # ------------------------------------------------------------
 
